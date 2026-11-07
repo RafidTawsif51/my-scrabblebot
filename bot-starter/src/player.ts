@@ -2,9 +2,12 @@
 // the letter-value cache, and turns game state into bids and word plays.
 // index.ts wires it to SpacetimeDB; sim.ts wires it to an offline engine.
 
-import { countsKey, letterIndex, totalOf, type Counts, type Dictionary } from "./dictionary.js";
+import { countsKey, letterIndex, LETTER_VALUES, totalOf, type Counts, type Dictionary } from "./dictionary.js";
+import { BingoIndex, relativeGain } from "./bingo.js";
+import { marketPrice as liveMarketPrice } from "./market.js";
 import {
   decideBid,
+  dynamicEndgameBag,
   PARAMS,
   planWords,
   type AuctionKind,
@@ -103,10 +106,19 @@ export class Player {
   }
 
   /** Decide the bid for the open auction, then queue precompute for the next one. */
+  private bingo: BingoIndex | null = null;
+
   bid(letter: string, view: PlayerView): BidOutcome {
     const t = this.tracker!;
+    const li = letterIndex(letter);
     const { value, source, k } = this.valueOf(letter, view);
     const market = t.marketPrice(letter);
+    let fit: number | undefined;
+    if (this.P.lucentMode > 0) {
+      this.bingo ??= new BingoIndex(this.dict);
+      const face = LETTER_VALUES[li]!;
+      fit = relativeGain(this.bingo.leave(view.rack), li) * (1 + (this.P.hvBoost * (face - 1)) / 9);
+    }
     const dec = decideBid({
       letter,
       valuePoints: value,
@@ -115,6 +127,11 @@ export class Player {
       auctionType: view.auctionType,
       marketPrice: market,
       avgPrice: t.avgPrice(),
+      floorPrice: t.marketPrice(letter, 0.5),
+      fit,
+      market: liveMarketPrice(letter),
+      held: li >= 0 ? view.rack[li]! : 0,
+      round: t.closedCount + 1,
       params: this.opts.params,
     });
     this.needCoins = dec.desired > view.balance && dec.desired > 0;
@@ -188,6 +205,27 @@ export class Player {
     return this.queue.length > 0;
   }
 
+  // Word reducer latencies (ms), kept across matches, newest last.
+  private wordLatencies: number[] = [];
+  auctionMs = 1000;
+
+  recordWordLatency(ms: number) {
+    this.wordLatencies.push(ms);
+    if (this.wordLatencies.length > 100) this.wordLatencies.shift();
+  }
+
+  /** p95 of recent word latencies, or undefined with too few samples. */
+  wordLatencyP95(): number | undefined {
+    if (this.wordLatencies.length < 3) return undefined;
+    const s = [...this.wordLatencies].sort((a, b) => a - b);
+    return s[Math.min(s.length - 1, Math.floor(0.95 * s.length))];
+  }
+
+  /** max(3, ceil(p95 word latency / auction length) + 2), see strategy.ts. */
+  endgameBag(): number {
+    return dynamicEndgameBag(this.P.endgameBag, this.wordLatencyP95(), this.auctionMs);
+  }
+
   /** Words to play now, given the rack actually available. */
   words(view: PlayerView): WordPlan {
     const plan = planWords({
@@ -197,6 +235,7 @@ export class Player {
       balance: view.balance,
       panic: this.panic,
       needCoins: this.needCoins,
+      endgameBag: this.endgameBag(),
       params: this.opts.params,
     });
     if (plan.words.length > 0 && plan.reason.startsWith("need coins")) this.needCoins = false;

@@ -12,8 +12,9 @@ export type AuctionKind = "Vickrey" | "FirstPrice";
 
 // Tunables (exported so the simulator can sweep them).
 export const PARAMS = {
-  // Values below were tuned with src/sim.ts (head-to-head tables vs the
-  // previous best settings, plus tables of module sim bots).
+  // Values below were tuned with src/sim.ts: first head-to-head vs earlier
+  // settings, then (2026-11-07) against opponents that mimic Bron/LUCENT's
+  // measured live bidding (sim rows "mimic", "mixed"; tools/bidmodel.json).
   /** Share of remaining auctions we plan to buy (for coin pacing). */
   buyShare: 0.15,
   /** Coin shadow price floor (coins nearly worthless) and ceiling. */
@@ -37,12 +38,57 @@ export const PARAMS = {
   minValue: 1.5,
   /** Monte Carlo samples: background precompute / on-the-spot. */
   mcSamples: 24,
-  mcQuick: 12,
+  mcQuick: 24,
   /** Cap on simulated future tiles (bounds search cost). */
   maxFuture: 7,
   /** Scale on my estimated future win rate (we choose tiles, not random). */
-  futureScale: 1.5,
+  futureScale: 2.5,
+  /**
+   * Market floor: for a letter worth at least `minValue` to us, bid at least
+   * floorFrac × the going price (this match's median, else live prices by
+   * face value). 0 disables it.
+   */
+  floorFrac: 0.7,
+
+  // ---- LUCENT-style mode (1 = on). Calibrated in sim.ts's "likecal" row,
+  // where these rules reproduce Bron's live tile volume and word profile.
+  lucentMode: 0,
+  /** Letter fits a plausible 7-8 letter word: bingo gain ≥ fitRel × best letter's. */
+  fitRel: 0.25,
+  /** High-value letters count as fitting more easily: × (1 + hvBoost × (face-1)/9). */
+  hvBoost: 3,
+  /** Bid at least market × fitMult on fitting letters (market = tools/bidmodel.json). */
+  fitMult: 1.0,
+  /** Bid at least market × unfitMult on other letters worth ≥ minValue (0 = off). */
+  unfitMult: 0,
+  dupMult: 0.7,
+  lateMult: 1.3,
+  lateRound: 55,
+  /** In the last N playable auctions, bid ≥ balance / N on fitting letters (aim for 0 coins). */
+  spendDown: 10,
+  /** Max share of balance for one market-floor bid (whole balance in the last 3). */
+  likeCap: 0.6,
+  /** Points added to a letter's value per unit of bingo fit. */
+  leaveWeight: 0,
+  /** Play any 7+ letter word as soon as it can be spelled. */
+  play7Any: 1,
 };
+
+/**
+ * Average price paid per tile on the live server by face value, measured
+ * over ~200 recent matches (tools/analyze.ts, 2026-11-07).
+ */
+export const LIVE_PRICE_BY_FACE: Record<number, number> = { 1: 9.5, 2: 11.8, 3: 14.6, 4: 15.9, 5: 19.2, 8: 21.3, 10: 19.9 };
+
+/**
+ * Bag size at or below which every word is played at once: at least
+ * `base`, and enough auctions to cover the slowest (p95) word submission
+ * plus two auctions of margin: max(base, ceil(p95 / auction length) + 2).
+ */
+export function dynamicEndgameBag(base: number, p95WordLatencyMs: number | undefined, auctionMs = 1000): number {
+  if (p95WordLatencyMs === undefined || !Number.isFinite(p95WordLatencyMs)) return base;
+  return Math.max(base, Math.ceil(p95WordLatencyMs / Math.max(1, auctionMs)) + 2);
+}
 
 /**
  * Auctions still able to deliver a playable tile, counting the open one.
@@ -85,6 +131,16 @@ export interface BidContext {
   marketPrice?: number;
   /** Mean price paid for sold tiles this match (for pacing). */
   avgPrice?: number;
+  /** Going price for this letter (for the market floor). */
+  floorPrice?: number;
+  /** LUCENT mode: bingo fit of this letter (relative gain, boosted for high values). */
+  fit?: number;
+  /** LUCENT mode: live market price for this letter (market.ts). */
+  market?: number;
+  /** Copies of this letter already in my rack. */
+  held?: number;
+  /** Auction number in the match (1-based). */
+  round?: number;
   params?: Params;
 }
 
@@ -104,14 +160,47 @@ export function decideBid(ctx: BidContext): BidDecision {
   const pl = playableLeft(ctx.bagTotal);
   const balance = Math.max(0, Math.floor(ctx.balance));
   if (pl === 0) return { amount: 0, desired: 0, reason: "last auction: tile unplayable" };
-  if (ctx.valuePoints < P.minValue) {
-    return { amount: 0, desired: 0, reason: `value ${ctx.valuePoints.toFixed(2)} too low` };
+  const lucent = P.lucentMode > 0;
+  const fits = lucent && (ctx.fit ?? 0) >= P.fitRel;
+  const value = ctx.valuePoints + (lucent ? P.leaveWeight * (ctx.fit ?? 0) : 0);
+  if (value < P.minValue && !fits) {
+    return { amount: 0, desired: 0, reason: `value ${value.toFixed(2)} too low` };
   }
   const lambda = coinShadowPrice(pl, balance, ctx.avgPrice, P);
-  const trueBid = ctx.valuePoints / lambda; // value in coins
+  const trueBid = value / lambda; // value in coins
   const cap = Math.floor(balance * capFraction(pl, P));
   let bid = Math.min(Math.round(trueBid), cap, balance);
+  let desired = Math.round(trueBid);
   let reason = `v=${ctx.valuePoints.toFixed(2)} λ=${lambda.toFixed(2)} cap=${cap}`;
+  // The floor is part of our valuation: live data shows the model's point
+  // values sit below what ordinary tiles are worth to the top bots, so a
+  // useful letter is worth at least floorFrac × its going price.
+  if (P.floorFrac > 0) {
+    const going = ctx.floorPrice ?? LIVE_PRICE_BY_FACE[LETTER_VALUES[letterIndex(ctx.letter)] ?? 1] ?? 10;
+    const floorRaw = Math.round(P.floorFrac * going);
+    desired = Math.max(desired, floorRaw);
+    const floor = Math.min(cap, balance, floorRaw);
+    if (floor > bid) {
+      reason += ` floor ${bid}->${floor} (going ${going})`;
+      bid = floor;
+    }
+  }
+  // LUCENT mode: at least the live market price on letters that fit a
+  // plausible 7-8 letter word (-30% for a letter already held, +30% late),
+  // and spend down toward 0 coins at the end.
+  if (lucent && ctx.market !== undefined) {
+    let m = ctx.market * (fits ? P.fitMult : value >= P.minValue ? P.unfitMult : 0);
+    if ((ctx.held ?? 0) > 0) m *= P.dupMult;
+    if ((ctx.round ?? 0) > P.lateRound) m *= P.lateMult;
+    if (fits && P.spendDown > 0 && pl <= P.spendDown) m = Math.max(m, balance / pl);
+    const likeCap = pl <= 3 ? balance : Math.floor(balance * P.likeCap);
+    const mBid = Math.min(likeCap, balance, Math.round(m));
+    desired = Math.max(desired, Math.round(m));
+    if (mBid > bid) {
+      reason += ` market ${bid}->${mBid} (fit ${(ctx.fit ?? 0).toFixed(2)}, mkt ${ctx.market.toFixed(1)})`;
+      bid = mBid;
+    }
+  }
 
   if (ctx.auctionType === "FirstPrice") {
     // Pay-your-bid: shade toward the price that has been winning this
@@ -123,7 +212,7 @@ export function decideBid(ctx: BidContext): BidDecision {
     bid = shaded;
   }
   bid = Math.max(0, Math.min(bid, balance));
-  return { amount: bid, desired: Math.round(trueBid), reason };
+  return { amount: bid, desired, reason };
 }
 
 export interface WordPlanContext {
@@ -135,6 +224,8 @@ export interface WordPlanContext {
   panic: boolean;
   /** Our last bid was capped by our balance. */
   needCoins: boolean;
+  /** Overrides params.endgameBag (see dynamicEndgameBag). */
+  endgameBag?: number;
   params?: Params;
 }
 
@@ -160,8 +251,14 @@ export function planWords(ctx: WordPlanContext): WordPlan {
   if (best.words.length === 0) return { words: [], reason: "no words" };
 
   if (ctx.panic) return { words: byReward(best.words), reason: "panic: latency" };
-  if (ctx.bagTotal <= P.endgameBag) {
-    return { words: byReward(best.words), reason: `endgame bag=${ctx.bagTotal}` };
+  const endgameBag = ctx.endgameBag ?? P.endgameBag;
+  if (ctx.bagTotal <= endgameBag) {
+    return { words: byReward(best.words), reason: `endgame bag=${ctx.bagTotal} (threshold ${endgameBag})` };
+  }
+  // LUCENT mode: any spellable 7+ letter word goes now, to recycle coins.
+  if (P.lucentMode > 0 && P.play7Any > 0) {
+    const seven = ctx.dict.candidates(ctx.rack, 7)[0];
+    if (seven) return { words: [seven.word], reason: "7+ letters now (lucent)" };
   }
   // A 7+ letter word already earns the top multiplier: bank it.
   const long = best.words.filter((w) => w.length >= 7);

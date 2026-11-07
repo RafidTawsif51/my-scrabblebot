@@ -6,7 +6,16 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const LOG_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "logs");
+const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+/** The live bot's log folder. Tests, sims and shadow runs must never write here. */
+export const LIVE_LOG_DIR = path.join(ROOT, "logs");
+/**
+ * Where this process logs: $BOT_LOG_DIR if set; shadow runs default to
+ * sim-output/shadow-logs (gitignored); only a real bot run uses logs/.
+ */
+export const LOG_DIR =
+  process.env.BOT_LOG_DIR ??
+  (process.env.SHADOW === "1" ? path.join(ROOT, "sim-output", "shadow-logs") : LIVE_LOG_DIR);
 
 export interface BidLog {
   auctionId: string;

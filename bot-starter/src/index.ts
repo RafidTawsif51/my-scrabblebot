@@ -200,6 +200,7 @@ function startMatch(conn: DbConnection, matchId: bigint) {
   const parts = participantsOf(conn, matchId);
   if (!parts.some((p) => p.botId === myBotId)) return;
   player.beginMatch(matchId, myBotId, m.startingRackSize, parts.length);
+  player.auctionMs = Number(m.auctionDurationMs) || 1000;
   currentMatchId = matchId;
   myBids.clear();
   openDesired = null;
@@ -226,8 +227,10 @@ function startMatch(conn: DbConnection, matchId: bigint) {
     tournament: tourn ? tourn.id.toString() : null,
     shadow: SHADOW,
   });
+  const p95 = player.wordLatencyP95();
   log(
-    `match ${matchId} started: ${parts.length} players, ${m.auctionType.tag}, rack ${rack}, bag ${m.bagTotal}`,
+    `match ${matchId} started: ${parts.length} players, ${m.auctionType.tag}, rack ${rack}, bag ${m.bagTotal}, ` +
+      `endgame at bag <= ${player.endgameBag()} (word p95 ${p95 === undefined ? "n/a" : Math.round(p95) + " ms"})`,
   );
   for (const a of auctions) if (a.status.tag === "Open") scheduleBid(conn, a.id);
   queueThink();
@@ -363,6 +366,7 @@ function think(conn: DbConnection) {
     log(`playing '${word}' (+${reward}, ${plan.reason})`);
     const t0 = performance.now();
     void timed(`word '${word}'`, () => conn.reducers.submitWord({ matchId, word })).then((ok) => {
+      player.recordWordLatency(performance.now() - t0);
       for (const c of word) reserved[letterIndex(c)] = Math.max(0, reserved[letterIndex(c)]! - 1);
       if (currentMatchId === matchId) {
         logger?.word({

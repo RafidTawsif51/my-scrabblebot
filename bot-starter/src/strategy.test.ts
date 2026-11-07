@@ -3,10 +3,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { countsOf, countsKey, Dictionary, totalOf, wordReward } from "./dictionary.js";
-import { decideBid, planWords, PARAMS } from "./strategy.js";
+import { decideBid, dynamicEndgameBag, planWords, PARAMS } from "./strategy.js";
 import { MatchTracker } from "./tracker.js";
 import { valueLetterNow } from "./valuation.js";
 import { simulateMatch } from "./sim.js";
+import { BingoIndex, relativeGain } from "./bingo.js";
+import { LIVE_LOG_DIR, LOG_DIR } from "./logger.js";
 
 const dict = Dictionary.load();
 
@@ -109,6 +111,54 @@ test("bids: first-price shades to market + 1 but never above the Vickrey bid", (
   assert.equal(fp, Math.min(4, v));
   const fpHigh = decideBid({ ...bidCtx, valuePoints: 2, auctionType: "FirstPrice", marketPrice: 50 });
   assert.ok(fpHigh.amount <= decideBid({ ...bidCtx, valuePoints: 2, auctionType: "FirstPrice" }).desired);
+});
+
+test("bids: market floor buys useful letters at a share of the going price", () => {
+  const ctx = { ...bidCtx, valuePoints: 2, balance: 100 };
+  const withFloor = decideBid({ ...ctx, floorPrice: 20, params: { ...PARAMS, floorFrac: 0.7 } });
+  assert.equal(withFloor.amount, 14);
+  assert.ok(withFloor.desired >= withFloor.amount);
+  const noFloor = decideBid({ ...ctx, floorPrice: 20, params: { ...PARAMS, floorFrac: 0 } });
+  assert.ok(noFloor.amount < withFloor.amount, `${noFloor.amount} vs ${withFloor.amount}`);
+  // Never for letters below minValue, and never above balance.
+  assert.equal(decideBid({ ...ctx, valuePoints: 0.2, floorPrice: 12 }).amount, 0);
+  assert.ok(decideBid({ ...ctx, balance: 5, floorPrice: 40 }).amount <= 5);
+});
+
+test("endgame threshold = max(3, ceil(p95 word latency s) + 2)", () => {
+  assert.equal(dynamicEndgameBag(3, undefined), 3);
+  assert.equal(dynamicEndgameBag(3, 145), 3); // ceil(0.145) + 2 = 3
+  assert.equal(dynamicEndgameBag(3, 1200), 4); // ceil(1.2) + 2 = 4
+  assert.equal(dynamicEndgameBag(3, 2500), 5);
+  assert.equal(plan("QIZTEDOG", { bagTotal: 5, endgameBag: 5 }).words.length >= 2, true);
+  assert.deepEqual(plan("QIZTE", { bagTotal: 5, endgameBag: 3 }).words, []);
+});
+
+test("bingo leave: rewards letters that complete 7-8 letter words", () => {
+  const bi = new BingoIndex(dict);
+  const near = bi.leave(countsOf("RETAINQ"));
+  assert.equal(near.minMissing, 1);
+  const best = [...near.gain].indexOf(Math.max(...near.gain));
+  assert.equal(best, 18); // S -> RETAINS
+  assert.equal(bi.leave(countsOf("AEINRST")).playable, 1);
+  assert.ok(relativeGain(bi.leave(countsOf("AERST")), 8) > relativeGain(bi.leave(countsOf("AERST")), 16)); // I > Q
+});
+
+test("lucent mode (off by default): market bid on fitting letters, any 7+ word now", () => {
+  assert.equal(PARAMS.lucentMode, 0);
+  const P = { ...PARAMS, lucentMode: 1 };
+  const base = { ...bidCtx, valuePoints: 0.5, balance: 100, market: 11, params: P };
+  assert.equal(decideBid({ ...base, fit: 0.9, round: 10 }).amount, 11);
+  assert.equal(decideBid({ ...base, fit: 0.9, round: 10, held: 1 }).amount, Math.round(11 * 0.7));
+  assert.equal(decideBid({ ...base, fit: 0.9, round: 60 }).amount, Math.round(11 * 1.3));
+  assert.equal(decideBid({ ...base, fit: 0.05, round: 10 }).amount, 0); // doesn't fit, low value
+  const p = planWords({ dict, rack: countsOf("RETAINSQZ"), bagTotal: 40, balance: 50, panic: false, needCoins: false, params: P });
+  assert.ok(p.words.length === 1 && p.words[0]!.length >= 7, p.reason);
+});
+
+test("test and shadow logging never targets the live logs folder", () => {
+  assert.ok(LIVE_LOG_DIR.endsWith("logs"));
+  if (process.env.BOT_LOG_DIR || process.env.SHADOW === "1") assert.notEqual(LOG_DIR, LIVE_LOG_DIR);
 });
 
 const plan = (letters: string, extra: Partial<Parameters<typeof planWords>[0]> = {}) =>

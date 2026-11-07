@@ -19,14 +19,158 @@ import {
   Dictionary,
 } from "./dictionary.js";
 import { Player, DEFAULT_OPTIONS } from "./player.js";
-import { PARAMS, type AuctionKind, type Params } from "./strategy.js";
+import { PARAMS, planWords, type AuctionKind, type Params } from "./strategy.js";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import { BingoIndex, relativeGain } from "./bingo.js";
 import { rng } from "./valuation.js";
 
-export type SeatKind = "me" | "alt" | "starter" | "Cheapskate" | "ValueBidder" | "Aggressive";
+export type SeatKind =
+  | "me"
+  | "alt"
+  | "starter"
+  | "bron"
+  | "lucent"
+  | "bronlike"
+  | "lucentlike"
+  | "other"
+  | "Cheapskate"
+  | "ValueBidder"
+  | "Aggressive";
 
 /** Parameters for "alt" seats (head-to-head comparisons). */
 export const ALT_PARAMS: Params = { ...PARAMS };
 const isBrain = (k: SeatKind) => k === "me" || k === "alt";
+const isMimic = (k: SeatKind) => k === "bron" || k === "lucent";
+const isLike = (k: SeatKind) => k === "bronlike" || k === "lucentlike";
+
+// ---------- Bron-like / LUCENT-like players (calibrated to live stats) ----------
+// Bid the bot's live market median on letters that move the rack toward a
+// 7-8 letter word (bingo leave), a fraction of it otherwise; play every
+// 7+ letter word at once; dump everything at the endgame.
+// Calibration (2026-11-07): with fitMult 1.8 / unfitMult 0.8 and weak
+// others (pBid 0.4) these rules reproduce Bron's live volume and word
+// profile (~20 tiles, ~9/tile, ~4 words, 65% 7+, ~110 points), but in that
+// field our own current bot would score ~118 vs ~83 live. Defaults below
+// are the "cal2" fit instead, which reproduces Jaeger's live stats (83
+// points, 12.5 tiles, 11.9/tile); in it these Bron-like rules score ~66,
+// so Bron's real edge is something this sim does not model.
+export const LIKE = {
+  /** A letter "fits" if its leave gain is at least this share of the best letter's. */
+  fitRel: 0.25,
+  fitMult: 1.3,
+  unfitMult: 1.0,
+  dup: 0.7,
+  late: 1.3,
+  lateRound: 55,
+  /** Share of balance one bid may use (all of it in the last 3 auctions). */
+  capFrac: 0.6,
+  /** Spend-down: in the last N playable auctions, bid at least balance / N on fitting letters. */
+  spendDown: 10,
+  endgameBag: 3,
+  /** 1: choose among 7+ words by reward + leave of what remains; 0: highest reward. */
+  smartSeven: 0,
+  /** Fit boost for high-value letters: relGain × (1 + hvBoost × (face - 1) / 9). */
+  hvBoost: 3,
+};
+/** Live "others" (≈53 points, 8.6 tiles): mimic bids scaled, play words of minLen+ at once. */
+export const OTHER = { scale: 1.0, minLen: 6, endgameBag: 3, pBid: 0.9 };
+
+/** Every bid made by me/alt seats in this process (for comparing with live logs). */
+export const BID_LOG: { kind: SeatKind; letter: string; amount: number; value: number; bag: number; balance: number }[] = [];
+
+let BINGO: BingoIndex | null = null;
+const bingoFor = (dict: Dictionary) => (BINGO ??= new BingoIndex(dict));
+
+function likeBid(
+  dict: Dictionary,
+  kind: SeatKind,
+  letter: string,
+  round: number,
+  bagTotal: number,
+  rack: Counts,
+  balance: number,
+): number {
+  const li = letterIndex(letter);
+  const q = MODEL[kind === "bronlike" ? "Bron" : "LUCENT"]!.letters[letter]!;
+  const info = bingoFor(dict).leave(rack);
+  const face = LETTER_VALUES[li]!;
+  const fits = relativeGain(info, li) * (1 + (LIKE.hvBoost * (face - 1)) / 9) >= LIKE.fitRel;
+  let b = q.med * (fits ? LIKE.fitMult : LIKE.unfitMult);
+  if (rack[li]! > 0) b *= LIKE.dup;
+  if (round > LIKE.lateRound) b *= LIKE.late;
+  if (LIKE.spendDown > 0 && fits && bagTotal <= LIKE.spendDown) {
+    b = Math.max(b, balance / Math.max(1, bagTotal));
+  }
+  if (bagTotal === 0) return 0; // last tile can't be played
+  const cap = bagTotal <= 3 ? balance : Math.floor(balance * LIKE.capFrac);
+  return Math.max(0, Math.min(cap, Math.round(b)));
+}
+
+/** Words a Bron-like player plays now. */
+function likeWords(dict: Dictionary, rack: Counts, bagTotal: number): string[] {
+  if (bagTotal <= LIKE.endgameBag) return dict.bestPlays(rack).words;
+  const sevens = dict.candidates(rack, 7);
+  if (sevens.length === 0) return [];
+  if (!LIKE.smartSeven) return [sevens[0]!.word];
+  // Prefer the 7+ word whose leftover rack keeps the best bingo leave.
+  let best = sevens[0]!.word;
+  let bestV = -1;
+  for (const c of sevens.slice(0, 12)) {
+    const rest = Uint8Array.from(rack);
+    for (const ch of c.word) rest[letterIndex(ch)]!--;
+    const v = c.reward + 0.02 * bingoFor(dict).leave(rest).score;
+    if (v > bestV) {
+      bestV = v;
+      best = c.word;
+    }
+  }
+  return [best];
+}
+
+// ---------- Bron / LUCENT mimics ----------
+// Bid model fitted from live data (tools/analyze.ts → tools/bidmodel.json):
+// per letter, the p25 / median / p75 of their winning bids.
+type BidQ = { med: number; p25: number; p75: number };
+const MODEL = JSON.parse(
+  fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "tools", "bidmodel.json"), "utf8"),
+) as Record<string, { letters: Record<string, BidQ> }>;
+
+/** Calibration knobs, set so simulated mimics reproduce live stats. */
+export const MIMIC = {
+  /** Multiplier on the fitted (winning-bid) quantiles. */
+  scale: 1,
+  /** Bid factor for a letter already held (live: ~0.7). */
+  dup: 0.7,
+  /** Bid factor after `lateRound` (live: medians rise ~30% late). */
+  late: 1.3,
+  lateRound: 55,
+  /** Never bid more than this share of balance (live: they keep a reserve). */
+  capFrac: 0.5,
+  /** Cash in a word at or below this balance. */
+  lowBalance: 3,
+};
+/** Word policy of the mimics: hoard toward 7+, cash in when low, dump at the end. */
+const mimicWords = (): Params => ({ ...PARAMS, endgameBag: 4, lowBalance: MIMIC.lowBalance, maxHoard: 16 });
+
+function mimicBid(
+  kind: SeatKind,
+  letter: string,
+  round: number,
+  held: number,
+  balance: number,
+  rand: () => number,
+): number {
+  const q = MODEL[kind === "bron" ? "Bron" : "LUCENT"]!.letters[letter]!;
+  const u = rand();
+  let b = u < 0.5 ? q.p25 + (q.med - q.p25) * (u / 0.5) : q.med + (q.p75 - q.med) * ((u - 0.5) / 0.5);
+  b *= MIMIC.scale;
+  if (held > 0) b *= MIMIC.dup;
+  if (round > MIMIC.lateRound) b *= MIMIC.late;
+  const cap = round > 64 ? balance : Math.floor(balance * MIMIC.capFrac);
+  return Math.max(0, Math.min(cap, Math.round(b)));
+}
 
 interface Seat {
   kind: SeatKind;
@@ -37,6 +181,8 @@ interface Seat {
   spent: number;
   wins: number;
   player?: Player;
+  winBids: { letter: string; bid: number; round: number }[];
+  wordLens: number[];
 }
 
 export interface SeatResult {
@@ -47,6 +193,9 @@ export interface SeatResult {
   wins: number;
   leftoverTiles: number;
   rank: number;
+  /** Winning (top) bids, for calibrating mimics against live data. */
+  winBids: { letter: string; bid: number; round: number }[];
+  wordLens: number[];
 }
 
 function simBid(kind: SeatKind, letter: string, balance: number, jitter: number): number {
@@ -107,6 +256,8 @@ export function simulateMatch(
     rack: emptyCounts(),
     spent: 0,
     wins: 0,
+    winBids: [],
+    wordLens: [],
   }));
   for (const s of seats) {
     for (let n = 0; n < 5; n++) {
@@ -136,6 +287,7 @@ export function simulateMatch(
     const r = wordReward(word);
     s.balance += r;
     s.score += r;
+    s.wordLens.push(word.length);
     everyone((p) => p.tracker!.onWord(s.botId, word));
     return true;
   };
@@ -161,6 +313,41 @@ export function simulateMatch(
           const w = longestWord(dict, s.rack, 2);
           if (!w || !play(s, w)) break;
         }
+      } else if (isLike(s.kind)) {
+        for (let guard = 0; guard < 8; guard++) {
+          const ws = likeWords(dict, s.rack, bagTotal);
+          if (ws.length === 0) break;
+          let any = false;
+          for (const w of ws) any = play(s, w) || any;
+          if (!any) break;
+        }
+      } else if (s.kind === "other") {
+        for (let guard = 0; guard < 8; guard++) {
+          const ws =
+            bagTotal <= OTHER.endgameBag
+              ? dict.bestPlays(s.rack).words
+              : dict.candidates(s.rack, OTHER.minLen).slice(0, 1).map((c) => c.word);
+          if (ws.length === 0) break;
+          let any = false;
+          for (const w of ws) any = play(s, w) || any;
+          if (!any) break;
+        }
+      } else if (isMimic(s.kind)) {
+        for (let guard = 0; guard < 8; guard++) {
+          const plan = planWords({
+            dict,
+            rack: s.rack,
+            bagTotal,
+            balance: s.balance,
+            panic: false,
+            needCoins: false,
+            params: mimicWords(),
+          });
+          if (plan.words.length === 0) break;
+          let any = false;
+          for (const w of plan.words) any = play(s, w) || any;
+          if (!any) break;
+        }
       }
     }
   };
@@ -176,9 +363,18 @@ export function simulateMatch(
     for (const s of seats) {
       let amount = 0;
       if (isBrain(s.kind)) {
-        amount = s.player!.bid(letter, view(s)).amount;
+        const out = s.player!.bid(letter, view(s));
+        amount = out.amount;
+        BID_LOG.push({ kind: s.kind, letter, amount, value: out.value, bag: bagTotal, balance: s.balance });
       } else if (s.kind === "starter") {
         amount = starterBid(letter, s.balance, s.rack);
+      } else if (isMimic(s.kind)) {
+        amount = mimicBid(s.kind, letter, Number(auctionId), s.rack[letterIndex(letter)]!, s.balance, rand);
+      } else if (isLike(s.kind)) {
+        amount = likeBid(dict, s.kind, letter, Number(auctionId), bagTotal, s.rack, s.balance);
+      } else if (s.kind === "other") {
+        const b = mimicBid("bron", letter, Number(auctionId), s.rack[letterIndex(letter)]!, s.balance, rand);
+        amount = rand() < OTHER.pBid ? Math.round(OTHER.scale * b) : 0;
       } else {
         const jitter = Math.floor(rand() * 5) - 2;
         amount = simBid(s.kind, letter, s.balance, jitter);
@@ -202,11 +398,13 @@ export function simulateMatch(
         winner.balance -= paid;
         winner.spent += paid;
         winner.wins++;
+        winner.winBids.push({ letter, bid: first!.amount, round: Number(auctionId) });
         winner.rack[letterIndex(letter)]!++;
       }
     }
     everyone((p) => p.tracker!.onResult(auctionId, letter!, winner?.botId, paid));
-    if (winner && !isBrain(winner.kind) && winner.kind !== "starter") {
+    const moduleSim = (k: SeatKind) => k === "Cheapskate" || k === "ValueBidder" || k === "Aggressive";
+    if (winner && moduleSim(winner.kind)) {
       const w = longestWord(dict, winner.rack, 3);
       if (w) play(winner, w);
     }
@@ -223,6 +421,8 @@ export function simulateMatch(
     wins: s.wins,
     leftoverTiles: totalOf(s.rack),
     rank: 0,
+    winBids: s.winBids,
+    wordLens: s.wordLens,
   }));
   for (const r of results) r.rank = 1 + results.filter((q) => q.score > r.score).length;
   return results;
@@ -241,6 +441,7 @@ function summarize(label: string, rows: SeatResult[][], kind: SeatKind) {
       `win ${((100 * wins) / n).toFixed(0)}%  spent ${avg((s) => s.spent)}  ` +
       `tiles ${avg((s) => s.wins)}  ppt ${(mine.reduce((a, s) => a + s.spent, 0) / Math.max(1, mine.reduce((a, s) => a + s.wins, 0))).toFixed(1)}  ` +
       `leftCoins ${avg((s) => s.balance)}  leftTiles ${avg((s) => s.leftoverTiles)}  ` +
+      `words ${avg((s) => s.wordLens.length)}  7+ ${(() => { const l = mine.flatMap((s) => s.wordLens); return l.length ? ((100 * l.filter((x) => x >= 7).length) / l.length).toFixed(0) : "-"; })()}%  ` +
       `tableBest ${(best.reduce((a, b) => a + b, 0) / best.length).toFixed(1)}`,
   );
 }
@@ -255,6 +456,19 @@ if (isMain) {
   // key=value sets PARAMS (the "me" seats); alt.key=value sets ALT_PARAMS.
   const sets = process.argv.slice(5).map((kv) => kv.split("=") as [string, string]);
   for (const [k0, v] of [...sets.filter(([k]) => !k.startsWith("alt.")), ...sets.filter(([k]) => k.startsWith("alt."))]) {
+    if (k0.startsWith("like.") || k0.startsWith("other.")) {
+      const obj = (k0.startsWith("like.") ? LIKE : OTHER) as Record<string, number>;
+      const k = k0.slice(k0.indexOf(".") + 1);
+      if (!(k in obj)) throw new Error(`unknown param ${k0}`);
+      obj[k] = Number(v);
+      continue;
+    }
+    if (k0.startsWith("mimic.")) {
+      const k = k0.slice(6);
+      if (!(k in MIMIC)) throw new Error(`unknown mimic param ${k}`);
+      (MIMIC as Record<string, number>)[k] = Number(v);
+      continue;
+    }
     const alt = k0.startsWith("alt.");
     const k = alt ? k0.slice(4) : k0;
     if (!(k in PARAMS)) throw new Error(`unknown param ${k}`);
@@ -273,15 +487,65 @@ if (isMain) {
     return p.slice(0, k);
   };
   const t0 = performance.now();
-  const run = (label: string, kind: SeatKind, table: (seed: number) => SeatKind[], also?: SeatKind) => {
+  const run = (label: string, kind: SeatKind, table: (seed: number) => SeatKind[], ...also: SeatKind[]) => {
     const rows: SeatResult[][] = [];
     for (let i = 0; i < n; i++) rows.push(simulateMatch(dict, table(1000 + i), type, 1000 + i));
     summarize(label, rows, kind);
-    if (also) summarize(`  ${also} in same tables`, rows, also);
+    for (const a of also) summarize(`  ${a} in same tables`, rows, a);
+    return rows;
   };
+  // Median winning bid by letter group, to compare with tools/analyze.ts.
+  const groups: [string, string][] = [["vowels", "AEIOU"], ["LNRT", "LNRT"], ["S", "S"], ["DG", "DG"], ["BCMP", "BCMP"], ["FHVWY", "FHVWY"], ["JX", "JX"], ["QZ", "QZ"]];
+  const bidProfile = (rows: SeatResult[][], kind: SeatKind) => {
+    const bids = rows.flatMap((r) => r.filter((s) => s.kind === kind).flatMap((s) => s.winBids));
+    const med = (xs: number[]) => { const s = [...xs].sort((a, b) => a - b); return s.length ? s[Math.floor(s.length / 2)] : "-"; };
+    const lens = rows.flatMap((r) => r.filter((s) => s.kind === kind).flatMap((s) => s.wordLens));
+    const seven = lens.filter((l) => l >= 7).length;
+    console.log(
+      `    ${kind} winning-bid medians: ` +
+        groups.map(([g, ls]) => `${g} ${med(bids.filter((b) => ls.includes(b.letter)).map((b) => b.bid))}`).join("  ") +
+        `  | rounds 1-20 ${med(bids.filter((b) => b.round <= 20).map((b) => b.bid))} 56+ ${med(bids.filter((b) => b.round > 55).map((b) => b.bid))}` +
+        `  | words 7+ ${lens.length ? ((100 * seven) / lens.length).toFixed(0) : "-"}%`,
+    );
+  };
+  // Live-calibration table: Bron + LUCENT + 4 "others" (old-Jaeger-like alt).
+  if (rowsWanted.has("cal")) {
+    const rows = run("cal: bron", "bron", () => ["bron", "lucent", "alt", "alt", "alt", "alt"], "lucent", "alt");
+    bidProfile(rows, "bron");
+    bidProfile(rows, "lucent");
+  }
+  // Tuning field: me against five Bron/LUCENT mimics.
+  if (rowsWanted.has("mimic")) {
+    const rows = run("me vs 5 mimics", "me", () => ["me", "bron", "lucent", "bron", "lucent", "bron"], "bron", "lucent");
+    bidProfile(rows, "me");
+  }
+  // Same seeds with the variant in my seat (paired comparison).
+  if (rowsWanted.has("mimicalt")) {
+    const rows = run("alt vs 5 mimics", "alt", () => ["alt", "bron", "lucent", "bron", "lucent", "bron"], "bron", "lucent");
+    bidProfile(rows, "alt");
+  }
+  if (rowsWanted.has("mixed")) run("me + bron + lucent + 3 old", "me", () => ["me", "bron", "lucent", "alt", "alt", "alt"], "bron", "lucent", "alt");
   const diff = Object.entries(ALT_PARAMS).filter(([k, v]) => (PARAMS as Record<string, number>)[k] !== v);
   console.log(`${n} matches per row, ${type}, PARAMS ${JSON.stringify(PARAMS)}`);
   if (diff.length) console.log(`alt differs: ${JSON.stringify(Object.fromEntries(diff))}`);
+  console.log(`MIMIC ${JSON.stringify(MIMIC)} LIKE ${JSON.stringify(LIKE)} OTHER ${JSON.stringify(OTHER)}`);
+  // Calibration: live tables are Bron + LUCENT + weaker "others".
+  if (rowsWanted.has("likecal"))
+    run("likecal: bronlike", "bronlike", () => ["bronlike", "lucentlike", "other", "other", "other", "other"], "lucentlike", "other");
+  // Calibration anchored on Jaeger too: the current version (alt) should
+  // land near its live stats (~83 points, ~12.5 tiles, ~12/tile).
+  if (rowsWanted.has("cal2"))
+    run("cal2: bronlike", "bronlike", () => ["bronlike", "lucentlike", "alt", "other", "other", "other"], "lucentlike", "alt", "other");
+  // Live-like table, and a hard table of only Bron/LUCENT-likes; *alt rows
+  // put the variant (alt) in my seat on the same seeds.
+  if (rowsWanted.has("like"))
+    run("me + bronlike + lucentlike + 3 others", "me", () => ["me", "bronlike", "lucentlike", "other", "other", "other"], "bronlike", "lucentlike");
+  if (rowsWanted.has("likealt"))
+    run("alt + bronlike + lucentlike + 3 others", "alt", () => ["alt", "bronlike", "lucentlike", "other", "other", "other"], "bronlike", "lucentlike");
+  if (rowsWanted.has("hard"))
+    run("me vs 5 bron/lucent-likes", "me", () => ["me", "bronlike", "lucentlike", "bronlike", "lucentlike", "bronlike"], "bronlike", "lucentlike");
+  if (rowsWanted.has("hardalt"))
+    run("alt vs 5 bron/lucent-likes", "alt", () => ["alt", "bronlike", "lucentlike", "bronlike", "lucentlike", "bronlike"], "bronlike", "lucentlike");
   if (rowsWanted.has("h2h")) run("me x3 vs alt x3", "me", () => ["me", "alt", "me", "alt", "me", "alt"], "alt");
   if (rowsWanted.has("duel")) run("me + alt + 4 sims", "me", (s) => ["me", "alt", ...pickSims(s, 4)], "alt");
   // A live-like field: five "alt" bots (tune alt.* to match live prices).
@@ -295,5 +559,17 @@ if (isMain) {
   if (rowsWanted.has("starters"))
     run("me vs 2 starters + 3 sims", "me", (s) => ["me", "starter", "starter", ...pickSims(s, 3)]);
   if (rowsWanted.has("self")) run("me vs 5 me (self-play)", "me", () => ["me", "me", "me", "me", "me", "me"]);
+  if (rowsWanted.has("bidprofile")) {
+    const med = (xs: number[]) => { const s = [...xs].sort((a, b) => a - b); return s.length ? s[Math.floor(s.length / 2)]! : NaN; };
+    for (const kind of ["me", "alt"] as SeatKind[]) {
+      const bl = BID_LOG.filter((b) => b.kind === kind);
+      if (!bl.length) continue;
+      console.log(`${kind} bids ${bl.length}, zero ${((100 * bl.filter((b) => b.amount === 0).length) / bl.length).toFixed(0)}%`);
+      for (const [g, ls] of [["vowels", "AEIOU"], ["LNRST", "LNRST"], ["DG", "DG"], ["BCMP", "BCMP"], ["FHVWY", "FHVWY"], ["JKXQZ", "JKXQZ"]]) {
+        const xs = bl.filter((b) => ls!.includes(b.letter));
+        console.log(`  ${g!.padEnd(7)} value med ${med(xs.map((b) => b.value)).toFixed(1)}  bid med ${med(xs.map((b) => b.amount))}  balance med ${med(xs.map((b) => b.balance))}`);
+      }
+    }
+  }
   console.log(`done in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
 }

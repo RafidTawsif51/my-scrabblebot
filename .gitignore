@@ -14,3 +14,4 @@ bot-starter/src/module_bindings/
 .token-*
 .env
 bot-starter/logs/
+bot-starter/sim-output/
