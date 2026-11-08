@@ -93,6 +93,45 @@ export const PARAMS = {
   l2EndBag: 12,
   /** Q/Z/J/X that fit a reachable 7+ word: bid up to this. */
   l2HiMax: 40,
+  /**
+   * Lucent2e endgame all-in (1 = on): in the last K = max(l2AllInK, dump
+   * threshold + 9) auctions, letters with endgame-partition gain > 0 get
+   * ceil(balance / ceil(auctionsLeft / 3)), the full balance in the final 3;
+   * no caps or reserve. Zero-gain letters still get 0.
+   */
+  l2AllIn: 0,
+  l2AllInK: 12,
+  /** Lucent2e completion premium: if this letter makes a 7+ word playable now, bid >= value + frac × its reward. */
+  l2eComplete: 0,
+  l2eCompleteFrac: 0.5,
+  /** Lucent2e heads-up (exactly 2 players): floor at huFloor × going price for letters worth >= huMinValue, plus denial. */
+  l2eHeadsUp: 0,
+  l2eHuFloor: 0.8,
+  l2eHuMinValue: 2,
+
+  // ---- Lucent3 (1 = on, on top of lucent2): no idle coins.
+  lucent3: 0,
+  /** Spend-down: scale bids up to this when spending slower than the trajectory. */
+  l3MaxScale: 1.6,
+  /** ...only on letters worth at least this many points. */
+  l3MinValue: 3,
+  /** Coins to finish with (trajectory end). */
+  l3Keep: 10,
+  /** Auctions of my own spending to look back over (unused since the trajectory fix). */
+  l3Window: 6,
+  /** Scale up only when balance exceeds the trajectory by more than this. */
+  l3Excess: 15,
+  /** Excess (beyond l3Excess) that adds +1.0 to the scale. */
+  l3ExcessSpan: 30,
+  /** Hard cap per bid: min(l3MarketMult × market, l3BalFrac × balance). */
+  l3MarketMult: 1.3,
+  l3BalFrac: 0.3,
+  /** While bag > l3ReserveBag, keep at least min(l3Reserve, 2 × auctions left). */
+  l3ReserveBag: 10,
+  l3Reserve: 20,
+  /** Earlier refuel: cash in a word when balance < this and bag > l3RefuelBag. */
+  l3RefuelBal: 25,
+  l3RefuelBag: 15,
 
   // ---- Fuel mode (1 = on): LexForge-1107 / RackMaw's measured live pattern.
   fuelMode: 0,
@@ -172,7 +211,47 @@ export function playableLeft(bagTotal: number): number {
  */
 export type Params = typeof PARAMS;
 
-export type JaegerMode = "v3" | "lucent" | "lucent2" | "fuel";
+export type JaegerMode = "v3" | "lucent" | "lucent2" | "lucent2e" | "lucent3" | "fuel";
+
+/**
+ * Lucent2e heads-up profile (call only with exactly 2 players): bid at least
+ * huFloor × going price on letters worth >= huMinValue (drain the rival),
+ * then add the letter's value to the rival (denial). Capped at balance.
+ */
+export function applyHeadsUp(
+  dec: BidDecision,
+  a: { value: number; balance: number; going: number; rivalValue: number; bagTotal: number },
+  P: Params = PARAMS,
+): BidDecision {
+  if (a.bagTotal <= 0) return dec; // last tile: unplayable for both
+  const balance = Math.max(0, Math.floor(a.balance));
+  let amount = dec.amount;
+  let reason = dec.reason;
+  if (a.value >= P.l2eHuMinValue) {
+    const floor = Math.min(balance, Math.ceil(P.l2eHuFloor * a.going));
+    if (floor > amount) {
+      reason += ` heads-up floor ${amount}->${floor}`;
+      amount = floor;
+    }
+  }
+  if (a.rivalValue > 0) {
+    const denied = Math.min(balance, amount + Math.round(a.rivalValue));
+    reason += ` denial +${Math.round(a.rivalValue)} -> ${denied}`;
+    amount = denied;
+  }
+  return { ...dec, amount, desired: Math.max(dec.desired, amount), reason };
+}
+
+/** Lucent2e: size of the all-in window, max(l2AllInK, dump threshold + 9). */
+export function allInWindow(P: Params, dumpBag: number): number {
+  return Math.max(P.l2AllInK, dumpBag + 9);
+}
+
+/** Lucent2e all-in bid for `playableLeft` auctions left (the open one included). */
+export function allInBid(balance: number, playableLeft: number): number {
+  if (playableLeft <= 3) return balance;
+  return Math.min(balance, Math.ceil(balance / Math.ceil(playableLeft / 3)));
+}
 
 /** Exact-enough best partition for endgame planning (wide beam). */
 export const EXACT_BEAM = [64, 32, 16, 8, 4, 2];
@@ -193,6 +272,8 @@ export function paramsForMode(mode: JaegerMode): Params {
     };
   }
   if (mode === "lucent2") return { ...paramsForMode("lucent"), lucent2: 1 };
+  if (mode === "lucent2e") return { ...paramsForMode("lucent2"), l2AllIn: 1, l2eComplete: 1, l2eHeadsUp: 1 };
+  if (mode === "lucent3") return { ...paramsForMode("lucent2"), lucent3: 1 };
   if (mode === "fuel") {
     // Coins are fuel: market-plus bids from round 1, no reserve, refuel by
     // cashing 5+ letter words when low. Balance-aware bidding stays on.
@@ -244,7 +325,47 @@ export interface BidContext {
   recentSpend?: { spent: number; auctions: number };
   /** Lucent2 endgame: exact best-partition gain from this letter (points). */
   endgameGain?: number;
+  /** Current endgame dump threshold (bag size), for lucent2e's all-in window. */
+  dumpBag?: number;
+  /** Lucent2e: reward of the 7+ word this letter makes playable now (0/undefined = none). */
+  completionReward?: number;
   params?: Params;
+}
+
+/**
+ * Lucent3 trajectory: the balance we'd have if the starting 100 coins were
+ * spent evenly down to l3Keep at the last playable auction. `totalPlayable`
+ * is the match's playable auctions (auctions closed so far + playable left).
+ */
+export function lucent3Trajectory(playableLeft: number, totalPlayable: number, P: Params = PARAMS): number {
+  const start = 100;
+  return P.l3Keep + ((start - P.l3Keep) * Math.max(0, playableLeft)) / Math.max(1, totalPlayable);
+}
+
+/**
+ * Lucent3 spend-down scale (>= 1 only), from balance vs trajectory:
+ * excess = balance - trajectory. Scales up only when excess > l3Excess,
+ * by 1 + (excess - l3Excess) / l3ExcessSpan, at most l3MaxScale.
+ */
+export function lucent3Scale(balance: number, playableLeft: number, totalPlayable: number, P: Params = PARAMS): number {
+  const excess = balance - lucent3Trajectory(playableLeft, totalPlayable, P);
+  if (excess <= P.l3Excess) return 1;
+  return Math.min(P.l3MaxScale, 1 + (excess - P.l3Excess) / P.l3ExcessSpan);
+}
+
+/**
+ * Lucent3 hard cap on any bid: min(1.3 × market, 30% of balance), and while
+ * the bag holds more than 10 tiles, never leave fewer than
+ * min(20, 2 × auctions left) coins.
+ */
+export function lucent3Cap(balance: number, playableLeft: number, market: number | undefined, P: Params = PARAMS): number {
+  let cap = Math.floor(balance * P.l3BalFrac);
+  if (market !== undefined) cap = Math.min(cap, Math.floor(market * P.l3MarketMult));
+  if (playableLeft > P.l3ReserveBag) {
+    const reserve = Math.min(P.l3Reserve, 2 * playableLeft);
+    cap = Math.min(cap, Math.max(0, balance - reserve));
+  }
+  return Math.max(0, cap);
 }
 
 /**
@@ -347,6 +468,21 @@ export function decideBid(ctx: BidContext): BidDecision {
       bid = mBid;
     }
   }
+  // Lucent3 spend-down: trajectory = linear from the current balance to
+  // l3Keep at the last playable auction, i.e. (balance - keep) / auctionsLeft
+  // per auction. Spending slower than that (rich & idle) scales the bid up
+  // to l3MaxScale, limited only by balance. Spending on/over pace: no change.
+  if (lucent && P.lucent3 > 0) {
+    const s = lucent3Scale(balance, pl, Math.max(pl, (ctx.round ?? 1) - 1 + pl), P);
+    if (s > 1 && value >= P.l3MinValue) {
+      const scaled = Math.min(balance, Math.round(Math.max(desired, bid) * s));
+      if (scaled > bid) {
+        reason += ` spend-down x${s.toFixed(2)} ${bid}->${scaled}`;
+        bid = scaled;
+      }
+      desired = Math.max(desired, scaled);
+    }
+  }
   // Fuel mode: no reserve. Bid a market-plus target from round 1, capped at
   // ~29% of balance (Q/Z/J/X that fit: up to ~44), and spend down to
   // ~fuelKeep coins over the last auctions.
@@ -401,6 +537,42 @@ export function decideBid(ctx: BidContext): BidDecision {
       reason += ` vickrey sure-win ${bid}->${balance} (maxOpp ${ctx.maxOppBalance} < value ${Math.round(trueBid)})`;
       bid = balance;
     }
+  }
+  // Lucent3 hard caps, after every other rule (incl. balance-aware).
+  if (lucent && P.lucent3 > 0) {
+    const cap = lucent3Cap(balance, pl, ctx.market, P);
+    if (bid > cap) {
+      reason += ` l3cap ${bid}->${cap}`;
+      bid = cap;
+    }
+  }
+  // Lucent2e endgame all-in: coins are worth nothing at the end, so in the
+  // last K auctions any letter that raises the final partition gets a big
+  // share of the balance (everything in the final 3). Overrides caps,
+  // reserve and first-price shading. Zero-gain letters returned 0 above.
+  if (
+    lucent &&
+    P.lucent2 > 0 &&
+    P.l2AllIn > 0 &&
+    ctx.endgameGain !== undefined &&
+    ctx.endgameGain > 0 &&
+    pl <= allInWindow(P, ctx.dumpBag ?? P.endgameBag)
+  ) {
+    const all = allInBid(balance, pl);
+    if (all > bid) {
+      reason += ` all-in ${bid}->${all} (gain ${ctx.endgameGain}, ${pl} left)`;
+      bid = all;
+    }
+    desired = Math.max(desired, all);
+  }
+  // Lucent2e completion premium: this letter makes a 7+ word playable now.
+  if (lucent && P.l2eComplete > 0 && (ctx.completionReward ?? 0) > 0) {
+    const prem = Math.min(balance, Math.round(value + P.l2eCompleteFrac * ctx.completionReward!));
+    if (prem > bid) {
+      reason += ` completes 7+ (+${ctx.completionReward}) ${bid}->${prem}`;
+      bid = prem;
+    }
+    desired = Math.max(desired, prem);
   }
   bid = Math.max(0, Math.min(bid, balance));
   return { amount: bid, desired, reason };
@@ -494,6 +666,15 @@ export function planWords(ctx: WordPlanContext): WordPlan {
         if (eight) return { words: [], reason: `hold '${pick.word}' for an 8 (${eight}) one letter away` };
       }
       return { words: [pick.word], reason: `${pick.len} letters, leave-aware (lucent2)` };
+    }
+    // Lucent3 earlier refuel: low on coins with plenty of auctions left ->
+    // cash in a real word (>= 4 letters, >= 10 points), best-split word first.
+    if (P.lucent3 > 0 && ctx.balance < P.l3RefuelBal && ctx.bagTotal > P.l3RefuelBag) {
+      const ok = (w: string) => w.length >= P.cashInMinLen && wordReward(w) >= P.cashInMinPoints;
+      const w =
+        byReward(best.words).find(ok) ??
+        ctx.dict.candidates(ctx.rack, P.cashInMinLen).find((c) => c.reward >= P.cashInMinPoints)?.word;
+      if (w) return { words: [w], reason: `refuel (balance ${ctx.balance}, lucent3)` };
     }
     // (d) Surplus cash-out: a 5-6 letter word whose points outweigh what
     // it costs the rack's 7-8 letter prospects.

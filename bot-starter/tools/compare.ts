@@ -66,11 +66,13 @@ const EXCLUDE = new Set([
   "45450", // mixed modes: bot restarted mid-match
 ]);
 
-const groups: Record<string, Row[]> = { v3: [], "v3 (tagged only)": [], lucent: [], lucent2: [], fuel: [] };
+const groups: Record<string, Row[]> = { v3: [], "v3 (tagged only)": [], lucent: [], lucent2: [], lucent2e: [], lucent3: [], fuel: [] };
 for (const r of rows) {
   if (EXCLUDE.has(String(r.matchId))) continue;
   if (r.mode === "lucent") groups.lucent!.push(r);
   else if (r.mode === "lucent2") groups.lucent2!.push(r);
+  else if (r.mode === "lucent2e") groups.lucent2e!.push(r);
+  else if (r.mode === "lucent3") groups.lucent3!.push(r);
   else if (r.mode === "fuel") groups.fuel!.push(r);
   else if (r.mode === "v3") {
     groups.v3!.push(r);

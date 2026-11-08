@@ -68,11 +68,11 @@ log(`dictionary: ${DICT.size} words`);
 
 // Live A/B: $env:JAEGER_MODE = "v3" (default, current behaviour) or "lucent".
 const MODE_RAW = (process.env.JAEGER_MODE ?? "v3").trim().toLowerCase();
-if (MODE_RAW !== "v3" && MODE_RAW !== "lucent" && MODE_RAW !== "lucent2" && MODE_RAW !== "fuel") {
-  console.error(`[${tag}] unknown JAEGER_MODE "${MODE_RAW}" (use v3, lucent, lucent2 or fuel)`);
+if (!["v3", "lucent", "lucent2", "lucent2e", "lucent3", "fuel"].includes(MODE_RAW)) {
+  console.error(`[${tag}] unknown JAEGER_MODE "${MODE_RAW}" (use v3, lucent, lucent2, lucent2e, lucent3 or fuel)`);
   process.exit(1);
 }
-const MODE: JaegerMode = MODE_RAW;
+const MODE = MODE_RAW as JaegerMode;
 const player = new Player(DICT, { params: paramsForMode(MODE) });
 log(`mode: ${MODE}`);
 
@@ -279,28 +279,47 @@ function finishMatch(conn: DbConnection, matchId: bigint) {
 
 // ---------- Bidding ----------
 
+/**
+ * A new auction: send a bid at once (cached value / a few samples), in the
+ * same tick the row arrives, before any word submission or recomputation.
+ * Then refine it after this transaction's callbacks have run (full
+ * valuation); a refined amount replaces the first (re-bids replace).
+ */
+function bidNow(conn: DbConnection, auctionId: bigint) {
+  try {
+    doBid(conn, auctionId, "fast");
+  } catch (e) {
+    warn(`fast bid error: ${errMsg(e)}`);
+  }
+  scheduleBid(conn, auctionId);
+}
+
 function scheduleBid(conn: DbConnection, auctionId: bigint) {
   // Run after every callback of this transaction, so the rack, balance and
   // bag count we read are all post-transaction.
   setImmediate(() => {
     try {
-      doBid(conn, auctionId);
+      doBid(conn, auctionId, "full");
     } catch (e) {
       warn(`bid error: ${errMsg(e)}`);
     }
   });
 }
 
-function doBid(conn: DbConnection, auctionId: bigint, rebid = false) {
+type BidKind = "fast" | "full" | "rebid";
+
+function doBid(conn: DbConnection, auctionId: bigint, kind: BidKind = "full") {
+  const rebid = kind === "rebid";
   const a = conn.db.auction.id.find(auctionId);
   if (!a || a.status.tag !== "Open" || a.matchId !== currentMatchId) return;
   const key = auctionId.toString();
-  if (!rebid && myBids.has(key)) return;
+  const sent = myBids.get(key);
+  if (kind === "fast" && sent !== undefined) return;
   const v = viewFor(conn, a.matchId);
   if (!v) return;
   syncParticipants(conn, a.matchId);
   player.tracker!.onAuction(a.id, a.letter);
-  const out = player.bid(a.letter, v);
+  const out = player.bid(a.letter, v, { fast: kind === "fast" });
   const lagMs = Date.now() - Number(a.opensAt.microsSinceUnixEpoch / 1000n);
   logger?.bid({
     auctionId: key,
@@ -313,21 +332,23 @@ function doBid(conn: DbConnection, auctionId: bigint, rebid = false) {
     source: out.source,
     futureDraws: out.futureDraws,
     market: out.market,
-    reason: out.reason + (rebid ? " (rebid)" : ""),
+    reason: out.reason + (kind === "full" ? "" : ` (${kind})`),
     lagMs,
   });
   openDesired = { auctionId, desired: out.desired };
   kickPump();
-  const prev = myBids.get(key) ?? 0;
+  const prev = sent ?? 0;
   if (rebid && out.amount <= prev) return;
-  if (out.amount <= 0 && !rebid) {
+  // Nothing new to send: no earlier bid and nothing to bid, or same amount.
+  if (sent === undefined && out.amount <= 0) {
     myBids.set(key, 0);
     return;
   }
+  if (sent !== undefined && out.amount === sent) return;
   myBids.set(key, out.amount);
   log(
-    `${rebid ? "re" : ""}bid ${out.amount} on '${a.letter}' (value ${out.value.toFixed(1)}, ` +
-      `bag ${v.bagTotal}, bal ${v.balance}, ${out.source}, lag ${lagMs}ms)`,
+    `${kind === "fast" ? "" : kind === "rebid" ? "re" : sent !== undefined ? "refined " : ""}bid ${out.amount} on '${a.letter}' ` +
+      `(value ${out.value.toFixed(1)}, bag ${v.bagTotal}, bal ${v.balance}, ${out.source}, lag ${lagMs}ms)`,
   );
   if (SHADOW) return;
   void timed(`bid on '${a.letter}'`, () => conn.reducers.submitBid({ auctionId, amount: BigInt(out.amount) }));
@@ -340,7 +361,7 @@ function maybeRebid(conn: DbConnection) {
   if (openDesired.desired <= sent) return;
   const me = myParticipant(conn, currentMatchId);
   if (!me || Number(me.balance) <= sent) return;
-  doBid(conn, openDesired.auctionId, true);
+  doBid(conn, openDesired.auctionId, "rebid");
 }
 
 // ---------- Word play ----------
@@ -486,7 +507,7 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
     }
     if (a.matchId !== currentMatchId) return;
     player.tracker?.onAuction(a.id, a.letter);
-    if (a.status.tag === "Open") scheduleBid(conn, a.id);
+    if (a.status.tag === "Open") bidNow(conn, a.id);
   });
   conn.db.auctionResult.onInsert((_ctx, r) => {
     if (r.matchId !== currentMatchId) return;

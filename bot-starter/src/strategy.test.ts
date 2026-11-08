@@ -3,7 +3,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { countsOf, countsKey, Dictionary, totalOf, wordReward } from "./dictionary.js";
-import { decideBid, dynamicEndgameBag, paramsForMode, planWords, PARAMS, spendRateScale } from "./strategy.js";
+import { marketPrice as liveMarketPrice } from "./market.js";
+import { allInBid, allInWindow, applyHeadsUp, decideBid, dynamicEndgameBag, lucent3Cap, lucent3Scale, paramsForMode, planWords, PARAMS, spendRateScale } from "./strategy.js";
 import { MatchTracker } from "./tracker.js";
 import { valueLetterNow } from "./valuation.js";
 import { simulateMatch } from "./sim.js";
@@ -313,6 +314,151 @@ test("latency spike: no global panic; it only raises the endgame threshold", () 
     for (let i = 0; i < 10; i++) p.recordCallLatency(120);
     assert.equal(p.endgameBag(), 3);
   }
+});
+
+test("lucent3: rich & idle raises bids (88 coins, bag 40); never scales down", () => {
+  const L2 = paramsForMode("lucent2");
+  const L3 = paramsForMode("lucent3");
+  assert.equal(L3.lucent3, 1);
+  assert.equal(L2.lucent3, 0);
+  // Match 45858: 88 coins at bag 40 (round 28 of ~67 playable), bids stuck at 5-12.
+  const ctx = { ...bidCtx, letter: "E", valuePoints: 4, balance: 88, bagTotal: 40, round: 28, fit: 0.1, market: 11, avgPrice: 12 };
+  const b2 = decideBid({ ...ctx, params: L2 }).amount;
+  const b3 = decideBid({ ...ctx, params: L3 }).amount;
+  assert.ok(b3 > b2, `lucent3 ${b3} should beat lucent2 ${b2}`);
+  assert.ok(b3 <= lucent3Cap(88, 40, 11, L3));
+  // Trajectory at bag 40 of 67: 10 + 90*40/67 ≈ 63.7 -> excess ≈ 24 > 15 -> scale up.
+  assert.ok(lucent3Scale(88, 40, 67, L3) > 1);
+  // Excess <= 15 (or below the trajectory): no scaling.
+  assert.equal(lucent3Scale(70, 40, 67, L3), 1);
+  assert.equal(lucent3Scale(36, 40, 67, L3), 1);
+  // Low-value letters are never scaled.
+  const low2 = decideBid({ ...ctx, valuePoints: 2, params: L2 }).amount;
+  assert.ok(decideBid({ ...ctx, valuePoints: 2, params: L3 }).amount <= low2);
+});
+
+test("lucent3 hard caps: no 35 on F at 36 coins (match 46091), keep a reserve while bag > 10", () => {
+  const L3 = paramsForMode("lucent3");
+  const f = { ...bidCtx, letter: "F", valuePoints: 12, balance: 36, bagTotal: 40, round: 28, fit: 0.9, market: 21, avgPrice: 12 };
+  const bF = decideBid({ ...f, params: L3 });
+  assert.ok(bF.amount <= 15, `F bid ${bF.amount} (${bF.reason})`);
+  assert.ok(36 - bF.amount >= 20); // reserve min(20, 2 x 40)
+  // Full-balance bid on S at 20 coins (later in 46091): now leaves the reserve.
+  const s = decideBid({ ...f, letter: "S", balance: 20, bagTotal: 30, market: 11, params: L3 });
+  assert.equal(s.amount, 0);
+  // Y for 27 (46106): capped at min(1.3 x market, 30% of balance).
+  const y = decideBid({ ...f, letter: "Y", balance: 90, market: 18, params: L3 });
+  assert.ok(y.amount <= Math.min(Math.floor(18 * 1.3), Math.floor(90 * 0.3)), `${y.amount}`);
+  // Late (bag <= 10) the reserve no longer applies; the % cap still does.
+  assert.equal(lucent3Cap(20, 8, 11, L3), 6);
+  assert.equal(lucent3Cap(36, 40, 21, L3), 10);
+});
+
+test("lucent3: broke & stuck refuels with a 10+ point 4-letter word (12 coins, bag 30)", () => {
+  const L3 = paramsForMode("lucent3");
+  // QUIZ is the only 10+ point word, and it's 4 letters: lucent2's 5-6
+  // letter surplus rule can't use it, so lucent2 sits on 12 coins.
+  const ctx = { dict, rack: countsOf("QUIZT"), bagTotal: 30, balance: 12, panic: false, needCoins: false, params: L3 };
+  assert.deepEqual(planWords(ctx).words, ["QUIZ"]);
+  // lucent2 at the same spot keeps hoarding (the stuck case).
+  assert.deepEqual(planWords({ ...ctx, params: paramsForMode("lucent2") }).words, []);
+  // Not late (bag <= 15) and not with junk-only racks.
+  assert.deepEqual(planWords({ ...ctx, bagTotal: 15 }).words, []);
+  assert.deepEqual(planWords({ ...ctx, rack: countsOf("ARTE") }).words, []);
+});
+
+test("lucent2e endgame all-in: spend leftover coins on letters that raise the final partition", () => {
+  const E = paramsForMode("lucent2e");
+  const L2 = paramsForMode("lucent2");
+  assert.equal(E.l2AllIn, 1);
+  assert.equal(L2.l2AllIn, 0);
+  const ctx = { ...bidCtx, letter: "S", valuePoints: 3, round: 60, market: 11, fit: 0.2, avgPrice: 12, dumpBag: 3, params: E };
+  // 8 auctions left, gain > 0, 60 coins: ceil(60 / ceil(8/3)) = 20.
+  assert.ok(decideBid({ ...ctx, balance: 60, bagTotal: 8, endgameGain: 6 }).amount >= 20);
+  assert.equal(allInBid(60, 8), 20);
+  // Final 3 playable auctions: full balance (Vickrey and first-price alike).
+  for (const left of [3, 2, 1]) {
+    assert.equal(decideBid({ ...ctx, balance: 47, bagTotal: left, endgameGain: 4 }).amount, 47);
+    assert.equal(decideBid({ ...ctx, balance: 47, bagTotal: left, endgameGain: 4, auctionType: "FirstPrice", marketPrice: 5 }).amount, 47);
+  }
+  // Zero gain: still 0. Last auction (bag 0): still 0.
+  assert.equal(decideBid({ ...ctx, balance: 60, bagTotal: 8, endgameGain: 0 }).amount, 0);
+  assert.equal(decideBid({ ...ctx, balance: 60, bagTotal: 0, endgameGain: 9 }).amount, 0);
+  // Window = max(12, dump threshold + 9): a raised threshold of 6 widens it to 15.
+  assert.equal(allInWindow(E, 3), 12);
+  assert.equal(allInWindow(E, 6), 15);
+  // Before the window nothing changes vs lucent2.
+  const early = { ...ctx, balance: 60, bagTotal: 20, round: 45 };
+  assert.equal(decideBid(early).amount, decideBid({ ...early, params: L2 }).amount);
+  // Inside the window lucent2e never bids less than lucent2 (and goes all-in at the end).
+  for (const left of [8, 5, 2]) {
+    const c = { ...ctx, balance: 60, bagTotal: left, endgameGain: 6 };
+    assert.ok(decideBid(c).amount >= decideBid({ ...c, params: L2 }).amount);
+  }
+  // Where it matters: a small positive gain mid-window, which lucent2 bids little for.
+  const small = { ...ctx, valuePoints: 1, balance: 60, bagTotal: 10, endgameGain: 2 };
+  const e = decideBid(small).amount;
+  const l2 = decideBid({ ...small, params: L2 }).amount;
+  assert.ok(e > l2 && e === allInBid(60, 10), `lucent2e ${e} vs lucent2 ${l2}`);
+});
+
+test("lucent2e completion premium fires only when the letter makes a 7+ word playable now", () => {
+  const E = paramsForMode("lucent2e");
+  const p = new Player(dict, { params: E });
+  p.beginMatch(9n, 7n, 5, 6);
+  const rack = countsOf("RETAIN");
+  const s = p.completionReward(rack, 18); // S -> RETAINS (7 letters)
+  assert.ok(s >= wordReward("RETAINS"), `S completion ${s}`);
+  assert.equal(p.completionReward(rack, 16), 0); // Q: no 7+ word
+  assert.equal(p.completionReward(countsOf("QZXJK"), 4), 0);
+  const ctx = { ...bidCtx, letter: "S", valuePoints: 5, balance: 100, bagTotal: 40, round: 20, market: 11, fit: 0.9, avgPrice: 11, params: E };
+  const withPrem = decideBid({ ...ctx, completionReward: s });
+  assert.ok(withPrem.amount >= Math.min(100, Math.round(5 + 0.5 * s)), withPrem.reason);
+  assert.ok(withPrem.reason.includes("completes 7+"));
+  assert.ok(!decideBid({ ...ctx, completionReward: 0 }).reason.includes("completes 7+"));
+  // Other modes ignore it.
+  assert.ok(!decideBid({ ...ctx, completionReward: s, params: paramsForMode("lucent2") }).reason.includes("completes"));
+});
+
+test("lucent2e heads-up: never at 6 players; at 2 players bid >= 0.8x going price", () => {
+  const E = paramsForMode("lucent2e");
+  const view = { rack: countsOf("RETAIN"), balance: 90, bagTotal: 40, auctionType: "Vickrey" as const };
+  const run = (players: number, params = E) => {
+    const p = new Player(dict, { params });
+    p.beginMatch(11n, 7n, 5, players);
+    p.tracker!.setParticipant(7n, 90, 0);
+    for (let i = 2; i <= players; i++) p.tracker!.setParticipant(BigInt(100 + i), 80, 0);
+    p.tracker!.onAuction(1n, "D");
+    return p.bid("D", view);
+  };
+  const six = run(6);
+  assert.ok(!/heads-up|denial/.test(six.reason), six.reason);
+  // 6-player bid identical to lucent2e with heads-up switched off.
+  assert.equal(six.amount, run(6, { ...E, l2eHeadsUp: 0 }).amount);
+  const two = run(2);
+  if (two.value >= E.l2eHuMinValue) {
+    assert.ok(two.amount >= Math.min(90, Math.ceil(0.8 * liveMarketPrice("D"))), `${two.amount} (${two.reason})`);
+  }
+  // The wrapper itself: floor and denial, capped at balance, never on the last auction.
+  const base = { amount: 3, desired: 3, reason: "x" };
+  assert.equal(applyHeadsUp(base, { value: 4, balance: 50, going: 12, rivalValue: 0, bagTotal: 20 }, E).amount, 10);
+  assert.equal(applyHeadsUp(base, { value: 4, balance: 50, going: 12, rivalValue: 6, bagTotal: 20 }, E).amount, 16);
+  assert.equal(applyHeadsUp(base, { value: 4, balance: 12, going: 12, rivalValue: 30, bagTotal: 20 }, E).amount, 12);
+  assert.equal(applyHeadsUp(base, { value: 1, balance: 50, going: 12, rivalValue: 0, bagTotal: 20 }, E).amount, 3);
+  assert.equal(applyHeadsUp(base, { value: 9, balance: 50, going: 12, rivalValue: 9, bagTotal: 0 }, E).amount, 3);
+});
+
+test("fast bid path: cached/quick value gives a bid without the full valuation", () => {
+  const p = new Player(dict, { params: paramsForMode("lucent2e") });
+  p.beginMatch(12n, 7n, 5, 6);
+  p.tracker!.onAuction(1n, "E");
+  const view = { rack: countsOf("RTAINS"), balance: 80, bagTotal: 30, auctionType: "Vickrey" as const };
+  const t0 = performance.now();
+  const fast = p.bid("E", view, { fast: true });
+  const fastMs = performance.now() - t0;
+  assert.ok(fast.amount > 0 && fastMs < 150, `fast ${fast.amount} in ${fastMs.toFixed(0)} ms`);
+  const full = p.bid("E", view);
+  assert.ok(full.amount > 0);
 });
 
 test("test and shadow logging never targets the live logs folder", () => {

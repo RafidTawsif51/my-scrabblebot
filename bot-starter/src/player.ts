@@ -6,6 +6,8 @@ import { countsKey, letterIndex, LETTER_VALUES, totalOf, type Counts, type Dicti
 import { BingoIndex, relativeGain } from "./bingo.js";
 import { marketPrice as liveMarketPrice } from "./market.js";
 import {
+  allInWindow,
+  applyHeadsUp,
   decideBid,
   dynamicEndgameBag,
   EXACT_BEAM,
@@ -97,7 +99,7 @@ export class Player {
   }
 
   /** Points value of `letter` for my rack now. */
-  valueOf(letter: string, view: PlayerView): { value: number; source: "cache" | "now"; k: number } {
+  valueOf(letter: string, view: PlayerView, fast = false): { value: number; source: "cache" | "now"; k: number } {
     const t = this.tracker!;
     const li = letterIndex(letter);
     if (li < 0) return { value: 0, source: "now", k: 0 };
@@ -105,7 +107,10 @@ export class Player {
     const cached = this.cache.get(this.key(view.rack, k, t.closedCount))?.value(li);
     if (cached !== undefined) return { value: cached, source: "cache", k };
     const pool = t.pool(view.rack, true);
-    const v = valueLetterNow(this.dict, view.rack, pool, k, this.P.mcQuick, li, this.seed++);
+    // Fast path (instant bid on auction arrival): a few samples only; the
+    // refined bid right after uses the full sample count.
+    const samples = fast ? Math.min(6, this.P.mcQuick) : this.P.mcQuick;
+    const v = valueLetterNow(this.dict, view.rack, pool, k, samples, li, this.seed++);
     return { value: v, source: "now", k };
   }
 
@@ -113,16 +118,37 @@ export class Player {
   private bingo: BingoIndex | null = null;
 
   /** Lucent2 endgame: how much `letter` raises the exact best partition of my rack. */
-  endgameGain(rack: Counts, letter: number): number {
+  endgameGain(rack: Counts, letter: number, fast = false): number {
     const withL = Uint8Array.from(rack);
     withL[letter]!++;
-    return this.dict.bestPlays(withL, EXACT_BEAM).total - this.dict.bestPlays(rack, EXACT_BEAM).total;
+    const beam = fast ? undefined : EXACT_BEAM;
+    return this.dict.bestPlays(withL, beam).total - this.dict.bestPlays(rack, beam).total;
   }
 
-  bid(letter: string, view: PlayerView): BidOutcome {
+  /** Lucent2e: reward of the 7+ word `letter` makes playable now (0 if none / no better). */
+  completionReward(rack: Counts, letter: number): number {
+    const withL = Uint8Array.from(rack);
+    withL[letter]!++;
+    const after = this.dict.candidates(withL, 7)[0];
+    if (!after) return 0;
+    const before = this.dict.candidates(rack, 7)[0];
+    return !before || after.reward > before.reward ? after.reward : 0;
+  }
+
+  /** Lucent2e heads-up denial: what `letter` adds to the rival's known rack. */
+  private rivalValue(letter: number): number {
+    const rival = this.tracker!.opponentRacks()[0];
+    if (!rival) return 0;
+    const withL = Uint8Array.from(rival.known);
+    withL[letter]!++;
+    return this.dict.bestPlays(withL).total - this.dict.bestPlays(rival.known).total;
+  }
+
+  bid(letter: string, view: PlayerView, opts: { fast?: boolean } = {}): BidOutcome {
     const t = this.tracker!;
     const li = letterIndex(letter);
-    const { value, source, k } = this.valueOf(letter, view);
+    const fast = opts.fast === true;
+    const { value, source, k } = this.valueOf(letter, view, fast);
     const market = t.marketPrice(letter);
     let fit: number | undefined;
     if (this.P.lucentMode > 0 || this.P.fuelMode > 0) {
@@ -130,7 +156,7 @@ export class Player {
       const face = LETTER_VALUES[li]!;
       fit = relativeGain(this.bingo.leave(view.rack), li) * (1 + (this.P.hvBoost * (face - 1)) / 9);
     }
-    const dec = decideBid({
+    let dec = decideBid({
       letter,
       valuePoints: value,
       balance: view.balance,
@@ -146,10 +172,41 @@ export class Player {
       maxOppBalance: t.maxOppBalance(),
       oppTotalBalance: t.oppTotalBalance(),
       matchPrice: this.P.fuelMode > 0 ? t.classPrice(letter, liveMarketPrice) : undefined,
-      endgameGain: this.P.lucent2 > 0 && view.bagTotal <= this.P.l2EndBag && li >= 0 ? this.endgameGain(view.rack, li) : undefined,
-      recentSpend: this.P.fuelMode > 0 ? t.recentMySpend(this.P.fuelCtrlWindow) : undefined,
+      endgameGain:
+        this.P.lucent2 > 0 &&
+        li >= 0 &&
+        view.bagTotal <=
+          (this.P.l2AllIn > 0 ? Math.max(this.P.l2EndBag, allInWindow(this.P, this.endgameBag())) : this.P.l2EndBag)
+          ? this.endgameGain(view.rack, li, fast)
+          : undefined,
+      dumpBag: this.endgameBag(),
+      completionReward: this.P.l2eComplete > 0 && li >= 0 ? this.completionReward(view.rack, li) : undefined,
+      recentSpend:
+        this.P.fuelMode > 0
+          ? t.recentMySpend(this.P.fuelCtrlWindow)
+          : this.P.lucent3 > 0
+            ? t.recentMySpend(this.P.l3Window)
+            : undefined,
       params: this.opts.params,
     });
+    // Lucent2e heads-up profile: exactly 2 players only; any error keeps the normal bid.
+    if (this.P.l2eHeadsUp > 0 && this.numPlayers === 2 && li >= 0) {
+      try {
+        dec = applyHeadsUp(
+          dec,
+          {
+            value,
+            balance: view.balance,
+            going: t.marketPrice(letter, 0.5) ?? liveMarketPrice(letter),
+            rivalValue: this.rivalValue(li),
+            bagTotal: view.bagTotal,
+          },
+          this.P,
+        );
+      } catch {
+        /* fall back to the normal bid */
+      }
+    }
     this.needCoins = dec.desired > view.balance && dec.desired > 0;
     this.last = { letter, bid: dec.amount, market };
     this.schedulePrecompute(letter, view, dec.amount, market);
