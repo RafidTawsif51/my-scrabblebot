@@ -78,7 +78,16 @@ export const LIKE = {
 export const OTHER = { scale: 1.0, minLen: 6, endgameBag: 3, pBid: 0.9 };
 
 /** Every bid made by me/alt seats in this process (for comparing with live logs). */
-export const BID_LOG: { kind: SeatKind; letter: string; amount: number; value: number; bag: number; balance: number }[] = [];
+export const BID_LOG: {
+  kind: SeatKind;
+  letter: string;
+  amount: number;
+  value: number;
+  bag: number;
+  balance: number;
+  reason: string;
+  maxOpp: number;
+}[] = [];
 
 let BINGO: BingoIndex | null = null;
 const bingoFor = (dict: Dictionary) => (BINGO ??= new BingoIndex(dict));
@@ -365,7 +374,16 @@ export function simulateMatch(
       if (isBrain(s.kind)) {
         const out = s.player!.bid(letter, view(s));
         amount = out.amount;
-        BID_LOG.push({ kind: s.kind, letter, amount, value: out.value, bag: bagTotal, balance: s.balance });
+        BID_LOG.push({
+          kind: s.kind,
+          letter,
+          amount,
+          value: out.value,
+          bag: bagTotal,
+          balance: s.balance,
+          reason: out.reason,
+          maxOpp: Math.max(...seats.filter((o) => o !== s).map((o) => o.balance)),
+        });
       } else if (s.kind === "starter") {
         amount = starterBid(letter, s.balance, s.rack);
       } else if (isMimic(s.kind)) {
@@ -492,8 +510,10 @@ if (isMain) {
     for (let i = 0; i < n; i++) rows.push(simulateMatch(dict, table(1000 + i), type, 1000 + i));
     summarize(label, rows, kind);
     for (const a of also) summarize(`  ${a} in same tables`, rows, a);
+    LAST_ROWS = rows;
     return rows;
   };
+  let LAST_ROWS: SeatResult[][] = [];
   // Median winning bid by letter group, to compare with tools/analyze.ts.
   const groups: [string, string][] = [["vowels", "AEIOU"], ["LNRT", "LNRT"], ["S", "S"], ["DG", "DG"], ["BCMP", "BCMP"], ["FHVWY", "FHVWY"], ["JX", "JX"], ["QZ", "QZ"]];
   const bidProfile = (rows: SeatResult[][], kind: SeatKind) => {
@@ -540,8 +560,20 @@ if (isMain) {
   // put the variant (alt) in my seat on the same seeds.
   if (rowsWanted.has("like"))
     run("me + bronlike + lucentlike + 3 others", "me", () => ["me", "bronlike", "lucentlike", "other", "other", "other"], "bronlike", "lucentlike");
-  if (rowsWanted.has("likealt"))
-    run("alt + bronlike + lucentlike + 3 others", "alt", () => ["alt", "bronlike", "lucentlike", "other", "other", "other"], "bronlike", "lucentlike");
+  let likeRows: SeatResult[][] | undefined;
+  if (rowsWanted.has("like")) likeRows = LAST_ROWS;
+  if (rowsWanted.has("likealt")) {
+    const altRows = run("alt + bronlike + lucentlike + 3 others", "alt", () => ["alt", "bronlike", "lucentlike", "other", "other", "other"], "bronlike", "lucentlike");
+    if (likeRows) {
+      // Same seeds: per-match difference of my seat's score (variant - current).
+      const d = altRows.map((r, i) => r[0]!.score - likeRows![i]![0]!.score);
+      const mean = d.reduce((a, b) => a + b, 0) / d.length;
+      const sd = Math.sqrt(d.reduce((a, b) => a + (b - mean) ** 2, 0) / (d.length - 1));
+      const se = sd / Math.sqrt(d.length);
+      const wins = altRows.filter((r) => r[0]!.rank === 1).length - likeRows.filter((r) => r[0]!.rank === 1).length;
+      console.log(`paired: variant - current = ${mean.toFixed(2)} ± ${se.toFixed(2)} (SE, n ${d.length}); 95% CI [${(mean - 1.96 * se).toFixed(2)}, ${(mean + 1.96 * se).toFixed(2)}]; first places ${wins >= 0 ? "+" : ""}${wins}`);
+    }
+  }
   if (rowsWanted.has("hard"))
     run("me vs 5 bron/lucent-likes", "me", () => ["me", "bronlike", "lucentlike", "bronlike", "lucentlike", "bronlike"], "bronlike", "lucentlike");
   if (rowsWanted.has("hardalt"))
@@ -565,6 +597,11 @@ if (isMain) {
       const bl = BID_LOG.filter((b) => b.kind === kind);
       if (!bl.length) continue;
       console.log(`${kind} bids ${bl.length}, zero ${((100 * bl.filter((b) => b.amount === 0).length) / bl.length).toFixed(0)}%`);
+      const trig = (s: string) => bl.filter((b) => b.reason.includes(s)).length;
+      console.log(
+        `  balance-aware: vickrey sure-win ${trig("sure-win")}, fp guaranteed ${trig("guaranteed")}, fp capped ${trig("capped")} | ` +
+          `maxOpp med by bag: >=45 ${med(bl.filter((b) => b.bag >= 45).map((b) => b.maxOpp))}, 15-44 ${med(bl.filter((b) => b.bag < 45 && b.bag >= 15).map((b) => b.maxOpp))}, <15 ${med(bl.filter((b) => b.bag < 15).map((b) => b.maxOpp))}; share maxOpp<15 ${((100 * bl.filter((b) => b.maxOpp < 15).length) / bl.length).toFixed(1)}%`,
+      );
       for (const [g, ls] of [["vowels", "AEIOU"], ["LNRST", "LNRST"], ["DG", "DG"], ["BCMP", "BCMP"], ["FHVWY", "FHVWY"], ["JKXQZ", "JKXQZ"]]) {
         const xs = bl.filter((b) => ls!.includes(b.letter));
         console.log(`  ${g!.padEnd(7)} value med ${med(xs.map((b) => b.value)).toFixed(1)}  bid med ${med(xs.map((b) => b.amount))}  balance med ${med(xs.map((b) => b.balance))}`);

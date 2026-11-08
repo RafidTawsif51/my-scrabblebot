@@ -204,6 +204,24 @@ export class MatchTracker {
     return sorted[Math.min(sorted.length - 1, Math.floor(percentile * sorted.length))]!;
   }
 
+  /**
+   * Highest balance among opponents in this match (public). Nobody can bid
+   * more than their balance, so a bid of maxOppBalance + 1 always wins.
+   * Every participant counts: a bot that hasn't bid yet still could.
+   */
+  maxOppBalance(): number {
+    let m = 0;
+    for (const b of this.bots.values()) if (b.botId !== this.myBotId && b.balance > m) m = b.balance;
+    return m;
+  }
+
+  /** Sum of opponents' balances. */
+  oppTotalBalance(): number {
+    let s = 0;
+    for (const b of this.bots.values()) if (b.botId !== this.myBotId) s += Math.max(0, b.balance);
+    return s;
+  }
+
   /** Mean price paid for sold tiles so far (default 4 before any sale). */
   avgPrice(): number {
     let sum = 0;

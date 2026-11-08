@@ -72,6 +72,24 @@ export const PARAMS = {
   leaveWeight: 0,
   /** Play any 7+ letter word as soon as it can be spelled. */
   play7Any: 1,
+
+  // ---- Balance-aware bidding (balances are public). 0 = off.
+  /**
+   * 1: use the opponents' max balance. First-price: never bid more than
+   * maxOpp + 1. Vickrey: the price can't exceed maxOpp, so when our value
+   * is above it, bid our whole balance (guaranteed win, pay <= maxOpp).
+   */
+  // On (2026-11-07): 600 paired sim matches, Vickrey +0.29 ± 0.11,
+  // first-price +0.86 ± 0.16 (cap only; the guaranteed-win variant +0.79).
+  balanceAware: 1,
+  /** First-price: also raise the bid to maxOpp + 1 (a sure win) whenever value allows. */
+  fpGuarantee: 0,
+  /**
+   * Pacing: expected price <= oppPaceK × opponents' coins per remaining
+   * auction (0 = off). Off: K=1 cost -2.0 (Vickrey) / -22 (first-price),
+   * K=2 -0.18 ± 0.28 over 600 paired matches.
+   */
+  oppPaceK: 0,
 };
 
 /**
@@ -141,6 +159,10 @@ export interface BidContext {
   held?: number;
   /** Auction number in the match (1-based). */
   round?: number;
+  /** Highest opponent balance right now (public). */
+  maxOppBalance?: number;
+  /** Sum of opponents' balances. */
+  oppTotalBalance?: number;
   params?: Params;
 }
 
@@ -166,7 +188,14 @@ export function decideBid(ctx: BidContext): BidDecision {
   if (value < P.minValue && !fits) {
     return { amount: 0, desired: 0, reason: `value ${value.toFixed(2)} too low` };
   }
-  const lambda = coinShadowPrice(pl, balance, ctx.avgPrice, P);
+  // If opponents hold few coins for the auctions left, future tiles will be
+  // cheap: price expectations drop, so we save less.
+  let avgPrice = ctx.avgPrice;
+  if (P.oppPaceK > 0 && ctx.oppTotalBalance !== undefined) {
+    const oppPerAuction = (P.oppPaceK * ctx.oppTotalBalance) / Math.max(1, pl);
+    avgPrice = Math.min(avgPrice ?? 4, oppPerAuction);
+  }
+  const lambda = coinShadowPrice(pl, balance, avgPrice, P);
   const trueBid = value / lambda; // value in coins
   const cap = Math.floor(balance * capFraction(pl, P));
   let bid = Math.min(Math.round(trueBid), cap, balance);
@@ -209,7 +238,26 @@ export function decideBid(ctx: BidContext): BidDecision {
     const market = ctx.marketPrice ?? face + 2;
     const shaded = Math.min(bid, Math.max(1, Math.ceil(market) + 1));
     reason += ` fp market=${market} shaded ${bid}->${shaded}`;
+    const valueBid = bid;
     bid = shaded;
+    if (P.balanceAware > 0 && ctx.maxOppBalance !== undefined) {
+      const sure = Math.max(1, Math.floor(ctx.maxOppBalance) + 1); // nobody can match this
+      if (P.fpGuarantee > 0 && sure <= valueBid) {
+        reason += ` guaranteed ${bid}->${sure} (maxOpp ${ctx.maxOppBalance})`;
+        bid = sure;
+      } else if (bid > sure) {
+        reason += ` capped ${bid}->${sure} (maxOpp ${ctx.maxOppBalance})`;
+        bid = sure;
+      }
+    }
+  } else if (P.balanceAware > 0 && ctx.maxOppBalance !== undefined && bid > 0) {
+    // Vickrey: we pay the second-highest bid, which can't exceed the richest
+    // opponent's balance. If our value beats that, bid everything: the win
+    // is certain and the price is still at most maxOpp.
+    if (Math.round(trueBid) > ctx.maxOppBalance && balance > ctx.maxOppBalance) {
+      reason += ` vickrey sure-win ${bid}->${balance} (maxOpp ${ctx.maxOppBalance} < value ${Math.round(trueBid)})`;
+      bid = balance;
+    }
   }
   bid = Math.max(0, Math.min(bid, balance));
   return { amount: bid, desired, reason };

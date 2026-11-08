@@ -156,6 +156,31 @@ test("lucent mode (off by default): market bid on fitting letters, any 7+ word n
   assert.ok(p.words.length === 1 && p.words[0]!.length >= 7, p.reason);
 });
 
+test("balance-aware bidding: first-price cap/guarantee, Vickrey sure win", () => {
+  assert.equal(PARAMS.balanceAware, 1);
+  const P = { ...PARAMS, balanceAware: 1, fpGuarantee: 1 };
+  const fp = { ...bidCtx, valuePoints: 8, balance: 100, auctionType: "FirstPrice" as const, params: P };
+  // Value allows maxOpp + 1: take the guaranteed win at the lowest sure price.
+  assert.equal(decideBid({ ...fp, marketPrice: 20, maxOppBalance: 4 }).amount, 5);
+  // Never above maxOpp + 1 even without the guarantee.
+  assert.ok(decideBid({ ...fp, marketPrice: 20, maxOppBalance: 4, params: { ...P, fpGuarantee: 0 } }).amount <= 5);
+  // Vickrey: value above everyone's balance -> bid everything (price <= maxOpp).
+  const v = decideBid({ ...bidCtx, valuePoints: 8, balance: 60, maxOppBalance: 3, params: P });
+  assert.equal(v.amount, 60);
+  // Rich opponents: same bid as with the feature off.
+  const off = decideBid({ ...bidCtx, valuePoints: 8, balance: 60, maxOppBalance: 100, params: { ...PARAMS, balanceAware: 0 } });
+  assert.equal(decideBid({ ...bidCtx, valuePoints: 8, balance: 60, maxOppBalance: 100, params: P }).amount, off.amount);
+});
+
+test("tracker: max / total opponent balance excludes me", () => {
+  const t = new MatchTracker(1n, 7n, 5);
+  t.setParticipant(7n, 500, 0);
+  t.setParticipant(8n, 30, 0);
+  t.setParticipant(9n, 12, 0);
+  assert.equal(t.maxOppBalance(), 30);
+  assert.equal(t.oppTotalBalance(), 42);
+});
+
 test("test and shadow logging never targets the live logs folder", () => {
   assert.ok(LIVE_LOG_DIR.endsWith("logs"));
   if (process.env.BOT_LOG_DIR || process.env.SHADOW === "1") assert.notEqual(LOG_DIR, LIVE_LOG_DIR);

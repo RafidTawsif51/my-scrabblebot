@@ -132,6 +132,8 @@ export class Player {
       market: liveMarketPrice(letter),
       held: li >= 0 ? view.rack[li]! : 0,
       round: t.closedCount + 1,
+      maxOppBalance: t.maxOppBalance(),
+      oppTotalBalance: t.oppTotalBalance(),
       params: this.opts.params,
     });
     this.needCoins = dec.desired > view.balance && dec.desired > 0;
