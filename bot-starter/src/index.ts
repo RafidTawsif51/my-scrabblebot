@@ -68,8 +68,8 @@ log(`dictionary: ${DICT.size} words`);
 
 // Live A/B: $env:JAEGER_MODE = "v3" (default, current behaviour) or "lucent".
 const MODE_RAW = (process.env.JAEGER_MODE ?? "v3").trim().toLowerCase();
-if (!["v3", "lucent", "lucent2", "lucent2e", "lucent3", "fuel"].includes(MODE_RAW)) {
-  console.error(`[${tag}] unknown JAEGER_MODE "${MODE_RAW}" (use v3, lucent, lucent2, lucent2e, lucent3 or fuel)`);
+if (!["v3", "lucent", "lucent2", "lucent2e", "lucent2h", "lucent3", "fuel"].includes(MODE_RAW)) {
+  console.error(`[${tag}] unknown JAEGER_MODE "${MODE_RAW}" (use v3, lucent, lucent2, lucent2e, lucent2h, lucent3 or fuel)`);
   process.exit(1);
 }
 const MODE = MODE_RAW as JaegerMode;

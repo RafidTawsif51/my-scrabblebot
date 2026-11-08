@@ -72,6 +72,7 @@ for (const r of rows) {
   if (r.mode === "lucent") groups.lucent!.push(r);
   else if (r.mode === "lucent2") groups.lucent2!.push(r);
   else if (r.mode === "lucent2e") groups.lucent2e!.push(r);
+  else if (r.mode === "lucent2h") (groups.lucent2h ??= []).push(r);
   else if (r.mode === "lucent3") groups.lucent3!.push(r);
   else if (r.mode === "fuel") groups.fuel!.push(r);
   else if (r.mode === "v3") {

@@ -211,7 +211,7 @@ export function playableLeft(bagTotal: number): number {
  */
 export type Params = typeof PARAMS;
 
-export type JaegerMode = "v3" | "lucent" | "lucent2" | "lucent2e" | "lucent3" | "fuel";
+export type JaegerMode = "v3" | "lucent" | "lucent2" | "lucent2e" | "lucent2h" | "lucent3" | "fuel";
 
 /**
  * Lucent2e heads-up profile (call only with exactly 2 players): bid at least
@@ -273,6 +273,8 @@ export function paramsForMode(mode: JaegerMode): Params {
   }
   if (mode === "lucent2") return { ...paramsForMode("lucent"), lucent2: 1 };
   if (mode === "lucent2e") return { ...paramsForMode("lucent2"), l2AllIn: 1, l2eComplete: 1, l2eHeadsUp: 1 };
+  // lucent2 + only the heads-up profile (fires only with exactly 2 players).
+  if (mode === "lucent2h") return { ...paramsForMode("lucent2"), l2eHeadsUp: 1 };
   if (mode === "lucent3") return { ...paramsForMode("lucent2"), lucent3: 1 };
   if (mode === "fuel") {
     // Coins are fuel: market-plus bids from round 1, no reserve, refuel by

@@ -448,6 +448,48 @@ test("lucent2e heads-up: never at 6 players; at 2 players bid >= 0.8x going pric
   assert.equal(applyHeadsUp(base, { value: 9, balance: 50, going: 12, rivalValue: 9, bagTotal: 0 }, E).amount, 3);
 });
 
+test("lucent2h = lucent2 + heads-up only: identical to lucent2 at 6 players", () => {
+  const H = paramsForMode("lucent2h");
+  const L2 = paramsForMode("lucent2");
+  assert.equal(H.l2eHeadsUp, 1);
+  assert.equal(H.l2AllIn, 0);
+  assert.equal(H.l2eComplete, 0);
+  assert.deepEqual({ ...H, l2eHeadsUp: 0 }, L2);
+  // Same seeds, same events: every bid across a range of letters, racks and
+  // bag sizes (incl. the endgame window) must match lucent2 at 6 players.
+  const racks = ["RETAIN", "QUIZT", "EEAIO", "BCDFGH", "AERSTL", ""];
+  for (const players of [6]) {
+    for (const rackStr of racks) {
+      for (const bag of [60, 40, 20, 12, 8, 3, 1, 0]) {
+        const mk = (params: typeof H) => {
+          const p = new Player(dict, { params });
+          p.beginMatch(21n, 7n, 5, players);
+          p.tracker!.setParticipant(7n, 70, 0);
+          for (let i = 2; i <= players; i++) p.tracker!.setParticipant(BigInt(100 + i), 60, 0);
+          return p;
+        };
+        const ph = mk(H), p2 = mk(L2);
+        for (const [i, L] of ["E", "S", "Q", "D", "Z", "A"].entries()) {
+          ph.tracker!.onAuction(BigInt(i + 1), L);
+          p2.tracker!.onAuction(BigInt(i + 1), L);
+          const view = { rack: countsOf(rackStr), balance: 70, bagTotal: bag, auctionType: "Vickrey" as const };
+          const a = ph.bid(L, view), b = p2.bid(L, view);
+          assert.equal(a.amount, b.amount, `rack ${rackStr} bag ${bag} letter ${L}: ${a.reason} vs ${b.reason}`);
+          assert.ok(!/heads-up|denial/.test(a.reason));
+        }
+      }
+    }
+  }
+  // At 2 players the heads-up profile can fire.
+  const p = new Player(dict, { params: H });
+  p.beginMatch(22n, 7n, 5, 2);
+  p.tracker!.setParticipant(7n, 70, 0);
+  p.tracker!.setParticipant(102n, 60, 0);
+  p.tracker!.onAuction(1n, "S");
+  const hu = p.bid("S", { rack: countsOf("RETAIN"), balance: 70, bagTotal: 40, auctionType: "Vickrey" });
+  assert.ok(hu.amount >= Math.min(70, Math.ceil(0.8 * liveMarketPrice("S"))), hu.reason);
+});
+
 test("fast bid path: cached/quick value gives a bid without the full valuation", () => {
   const p = new Player(dict, { params: paramsForMode("lucent2e") });
   p.beginMatch(12n, 7n, 5, 6);
