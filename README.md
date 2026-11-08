@@ -160,7 +160,9 @@ $env:SHADOW="1"; npm start
 - **Clockwork Labs** for ScrabbleBot, the SpacetimeDB module, spectator
   site and bot starter
   ([clockworklabs/scrabblebot](https://github.com/clockworklabs/scrabblebot), MIT).
-- The public writeups of **Vickrey-Scrabblebot** and **Nijello**. Ideas
+- The public writeups of
+  **[Vickrey-Scrabblebot](https://github.com/KarthikSubramanian07/Vickrey-Scrabblebot)**
+  and **[Nijello](https://github.com/3nvyx/nijello-scabble-bot)**. Ideas
   drawn from them include the completion premium, heads-up play and
   latency-safe bidding.
 - Everyone in the live field. Their public match data was the best
