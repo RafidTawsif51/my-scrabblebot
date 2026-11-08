@@ -142,6 +142,7 @@ export class MatchLogger {
         bot: this.botName,
         matchId: record.matchId,
         endedAt: record.endedAt,
+        mode: this.info.mode ?? null,
         auctionType: this.info.auctionType,
         tournament: this.info.tournament ?? null,
         rank: final.rank,

@@ -222,6 +222,39 @@ export class MatchTracker {
     return s;
   }
 
+  /**
+   * This match's clearing price for `letter`'s class (face 1 / 2 / 3 /
+   * 4-5 / 8-10): the median `paid` of the last 10 sold tiles in that class.
+   * Needs 5+ sold auctions this match; a class with < 2 sales is
+   * estimated as `fallback` × (this match's mean paid / mean fallback
+   * price of the tiles sold). Undefined until then.
+   */
+  classPrice(letter: string, fallback: (l: string) => number): number | undefined {
+    const sold = [...this.auctions.values()].filter((a) => a.closed && a.winner !== undefined);
+    if (sold.length < 5) return undefined;
+    const cls = (l: string) => {
+      const v = LETTER_VALUES[letterIndex(l)] ?? 1;
+      return v >= 8 ? 8 : v >= 4 ? 4 : v;
+    };
+    const mine = sold.filter((a) => cls(a.letter) === cls(letter)).slice(-10).map((a) => a.paid);
+    if (mine.length >= 2) {
+      const s = [...mine].sort((a, b) => a - b);
+      return s[Math.floor(s.length / 2)]!;
+    }
+    const paid = sold.reduce((t, a) => t + a.paid, 0) / sold.length;
+    const ref = sold.reduce((t, a) => t + fallback(a.letter), 0) / sold.length;
+    return ref > 0 ? fallback(letter) * (paid / ref) : undefined;
+  }
+
+  /** What I paid over the last `window` closed auctions: { spent, auctions }. */
+  recentMySpend(window: number): { spent: number; auctions: number } {
+    const closed = [...this.auctions.values()].filter((a) => a.closed).slice(-window);
+    return {
+      spent: closed.reduce((t, a) => t + (a.winner === this.myBotId ? a.paid : 0), 0),
+      auctions: closed.length,
+    };
+  }
+
   /** Mean price paid for sold tiles so far (default 4 before any sale). */
   avgPrice(): number {
     let sum = 0;

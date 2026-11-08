@@ -3,11 +3,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { countsOf, countsKey, Dictionary, totalOf, wordReward } from "./dictionary.js";
-import { decideBid, dynamicEndgameBag, planWords, PARAMS } from "./strategy.js";
+import { decideBid, dynamicEndgameBag, paramsForMode, planWords, PARAMS, spendRateScale } from "./strategy.js";
 import { MatchTracker } from "./tracker.js";
 import { valueLetterNow } from "./valuation.js";
 import { simulateMatch } from "./sim.js";
 import { BingoIndex, relativeGain } from "./bingo.js";
+import { Player } from "./player.js";
 import { LIVE_LOG_DIR, LOG_DIR } from "./logger.js";
 
 const dict = Dictionary.load();
@@ -181,6 +182,139 @@ test("tracker: max / total opponent balance excludes me", () => {
   assert.equal(t.oppTotalBalance(), 42);
 });
 
+test("JAEGER_MODE params: v3 = defaults; lucent = market 1.0/0.6, 7+ now, prefer 8", () => {
+  assert.deepEqual(paramsForMode("v3"), PARAMS);
+  const L = paramsForMode("lucent");
+  assert.equal(L.lucentMode, 1);
+  assert.equal(L.balanceAware, 1); // kept on in both modes
+  const base = { ...bidCtx, valuePoints: 0.2, balance: 100, market: 10, round: 10, params: L };
+  assert.equal(decideBid({ ...base, fit: 0.9 }).amount, 10); // fits: 1.0x market
+  assert.equal(decideBid({ ...base, fit: 0.0 }).amount, 6); // otherwise 0.6x, even if low value
+  // RETAINERS-style rack: an 8-letter word beats the 7s when both are playable.
+  const rack = countsOf("RETAINERS");
+  const p = planWords({ dict, rack, bagTotal: 40, balance: 50, panic: false, needCoins: false, params: L });
+  assert.ok(p.words[0]!.length >= 8, `${p.words} (${p.reason})`);
+});
+
+test("fuel mode: market-plus bids without reserve, refuel with 5+ words, no 2-letter words", () => {
+  const F = paramsForMode("fuel");
+  assert.equal(F.fuelMode, 1);
+  assert.equal(F.balanceAware, 1);
+  assert.equal(paramsForMode("v3").fuelMode, 0);
+  assert.equal(paramsForMode("lucent").fuelMode, 0);
+  const base = { ...bidCtx, valuePoints: 2, balance: 100, round: 5, params: F };
+  // Fitting vowel at a market of ~10.5 -> ~15, within 29% of balance.
+  assert.equal(decideBid({ ...base, letter: "A", fit: 0.9, market: 10.5 }).amount, 15);
+  assert.ok(decideBid({ ...base, letter: "A", fit: 0.9, market: 10.5, balance: 40 }).amount <= Math.floor(40 * 0.29));
+  // Fitting Q: up to 44 even above 29% of balance.
+  assert.equal(decideBid({ ...base, letter: "Q", fit: 0.9, market: 40 }).amount, 44);
+  // Low balance: refuel with a 5+ letter word, never a 2-letter word.
+  const low = planWords({ dict, rack: countsOf("QUIZTOX"), bagTotal: 40, balance: 10, panic: false, needCoins: false, params: F });
+  assert.ok(low.words.length === 1 && low.words[0]!.length >= 5, `${low.words} ${low.reason}`);
+  const rich = planWords({ dict, rack: countsOf("QUIZTOX"), bagTotal: 40, balance: 60, panic: false, needCoins: false, params: F });
+  assert.deepEqual(rich.words, []);
+  const seven = planWords({ dict, rack: countsOf("RETAINSQ"), bagTotal: 40, balance: 60, panic: false, needCoins: false, params: F });
+  assert.ok(seven.words[0]!.length >= 7);
+});
+
+test("fuel spend-rate controller: high balance + losing streak raises bids (match 45457)", () => {
+  const F = paramsForMode("fuel");
+  // 110 coins, 20 auctions left: planned spend (110-10)/20 = 5 per auction.
+  const streak = { spent: 0, auctions: 6 }; // won nothing lately
+  const onPace = { spent: 30, auctions: 6 }; // 5 per auction
+  const tooFast = { spent: 120, auctions: 6 };
+  assert.equal(spendRateScale(110, 20, streak, F), 2); // capped at 2x
+  assert.ok(Math.abs(spendRateScale(110, 20, onPace, F) - 1) < 1e-9);
+  assert.equal(spendRateScale(110, 20, tooFast, F), 0.5); // capped at 0.5x
+  assert.equal(spendRateScale(110, 20, undefined, F), 1);
+  // Same auction, same prices: the streak must bid more than being on pace.
+  // avgPrice 14 as at that table: the value path alone gives ~11 (the live bug).
+  const ctx = { ...bidCtx, letter: "E", valuePoints: 4, balance: 110, bagTotal: 20, round: 48, fit: 0.9, market: 11, matchPrice: 15, avgPrice: 14, params: F };
+  assert.ok(decideBid({ ...ctx, params: { ...F, fuelMode: 0 } }).amount <= 13);
+  const hot = decideBid({ ...ctx, recentSpend: streak }).amount;
+  const calm = decideBid({ ...ctx, recentSpend: onPace }).amount;
+  assert.ok(hot > calm, `streak ${hot} should beat on-pace ${calm}`);
+  assert.ok(hot > 13, `streak bid ${hot} must clear the 11-13 that lost in 45457`);
+  assert.ok(hot <= Math.floor(110 * F.fuelCap));
+  // v3 and lucent ignore the controller.
+  const v3 = decideBid({ ...ctx, params: paramsForMode("v3"), recentSpend: streak }).amount;
+  assert.equal(v3, decideBid({ ...ctx, params: paramsForMode("v3"), recentSpend: onPace }).amount);
+});
+
+test("fuel price learning: in-match class prices replace bidmodel after 5 sales", () => {
+  const t = new MatchTracker(1n, 7n, 5);
+  const model = () => 10;
+  const sell = (id: bigint, l: string, paid: number) => {
+    t.onAuction(id, l);
+    t.onResult(id, l, 9n, paid);
+  };
+  sell(1n, "E", 16);
+  sell(2n, "A", 18);
+  sell(3n, "T", 17);
+  sell(4n, "C", 21);
+  assert.equal(t.classPrice("E", model), undefined); // only 4 sales
+  sell(5n, "O", 19);
+  assert.equal(t.classPrice("I", model), 18); // median of 1-pt class: 16,17,18,19
+  // Class with no sales: model price scaled by this table's price level.
+  const z = t.classPrice("Z", model)!;
+  assert.ok(z > 10 && Math.abs(z - 10 * (91 / 5 / 10)) < 1e-9);
+  const s = t.recentMySpend(6);
+  assert.deepEqual(s, { spent: 0, auctions: 5 });
+});
+
+test("lucent2: modes, surplus 5-6 cash-out, hold-for-8, exact endgame, Q/Z up to 40", () => {
+  const L2 = paramsForMode("lucent2");
+  assert.equal(L2.lucent2, 1);
+  assert.equal(paramsForMode("lucent").lucent2, 0);
+  const bi = new BingoIndex(dict);
+  const leave = (r: Uint8Array) => Math.log1p(bi.leave(r).score);
+  const ctx = { dict, bagTotal: 40, balance: 50, panic: false, needCoins: false, leave, params: L2 };
+  // Surplus: QUAKY-style junk alongside a strong 7-letter core gets cashed as a 5-6 word.
+  const sur = planWords({ ...ctx, rack: countsOf("JUMPYAEIRST") });
+  assert.ok(sur.words.length === 1 && sur.words[0]!.length >= 5 && sur.words[0]!.length <= 7, `${sur.words} ${sur.reason}`);
+  // Hold a 7 when an 8 is one likely letter away, bag >= 25, balance >= 30.
+  const pool = countsOf("SSSSEEEEAAAA");
+  const hold = planWords({ ...ctx, rack: countsOf("RETAINS"), pool });
+  assert.deepEqual(hold.words, [], hold.reason);
+  // ...but not late or when short of coins.
+  assert.equal(planWords({ ...ctx, rack: countsOf("RETAINS"), pool, bagTotal: 20 }).words.length, 1);
+  assert.equal(planWords({ ...ctx, rack: countsOf("RETAINS"), pool, balance: 20 }).words.length, 1);
+  // Endgame: exact partition, no junk 2-letter word when a better split exists.
+  const eg = planWords({ ...ctx, rack: countsOf("QUIZDOGTEA"), bagTotal: 3 });
+  const total = eg.words.reduce((s, w) => s + wordReward(w), 0);
+  assert.ok(total >= dict.bestPlays(countsOf("QUIZDOGTEA")).total);
+  // Bidding: endgame letter that adds nothing gets 0 even with a market floor.
+  const b = { ...bidCtx, valuePoints: 3, balance: 100, bagTotal: 8, round: 60, market: 11, fit: 0.9, params: L2 };
+  assert.equal(decideBid({ ...b, endgameGain: 0 }).amount, 0);
+  assert.ok(decideBid({ ...b, endgameGain: 9 }).amount > 0);
+  // Q that fits a reachable 7+: up to 40.
+  assert.equal(decideBid({ ...bidCtx, letter: "Q", valuePoints: 5, balance: 100, round: 10, market: 28, fit: 0.9, params: L2 }).amount, 40);
+});
+
+test("latency spike: no global panic; it only raises the endgame threshold", () => {
+  for (const mode of ["v3", "lucent", "lucent2"] as const) {
+    const p = new Player(dict, { params: paramsForMode(mode) });
+    p.beginMatch(1n, 7n, 5, 6);
+    const rack = countsOf("EHORNIS"); // EH, OR, IN, ... (the match-45677 junk)
+    const view = (bagTotal: number) => ({ rack, balance: 60, bagTotal, auctionType: "Vickrey" as const });
+    for (let i = 0; i < 5; i++) p.recordCallLatency(120);
+    assert.equal(p.endgameBag(), 3);
+    p.recordCallLatency(2374); // the live spike
+    assert.equal(p.panic, false);
+    assert.equal(p.endgameBag(), 6); // ceil(2374 / 1000) + 3
+    // Mid-game (bag 37): no junk dump.
+    const mid = p.words(view(37));
+    assert.ok(!mid.words.some((w) => w.length < 4), `${mode} bag 37 played ${mid.words} (${mid.reason})`);
+    assert.ok(!mid.reason.startsWith("endgame") && !mid.reason.startsWith("panic"), mid.reason);
+    // Near the end (bag 5 <= 6): the dump starts early.
+    const late = p.words(view(5));
+    assert.ok(late.words.length > 0 && late.reason.includes("endgame"), `${mode} bag 5: ${late.reason}`);
+    // The spike ages out after ~10 calls; the threshold comes back down.
+    for (let i = 0; i < 10; i++) p.recordCallLatency(120);
+    assert.equal(p.endgameBag(), 3);
+  }
+});
+
 test("test and shadow logging never targets the live logs folder", () => {
   assert.ok(LIVE_LOG_DIR.endsWith("logs"));
   if (process.env.BOT_LOG_DIR || process.env.SHADOW === "1") assert.notEqual(LOG_DIR, LIVE_LOG_DIR);
@@ -192,8 +326,11 @@ const plan = (letters: string, extra: Partial<Parameters<typeof planWords>[0]> =
 test("words: hoard mid-game, bank 7+ letters, cash in when short of coins", () => {
   assert.deepEqual(plan("QIZTE").words, []); // hoarding
   assert.ok(plan("RETAINSQ").words.some((w) => w.length >= 7));
-  assert.equal(plan("QIZTE", { needCoins: true }).words.length, 1);
-  assert.equal(plan("QIZTE", { balance: PARAMS.lowBalance }).words.length, 1);
+  assert.deepEqual(plan("QUIZTE", { needCoins: true }).words, ["QUIZ"]);
+  assert.deepEqual(plan("QUIZTE", { balance: PARAMS.lowBalance }).words, ["QUIZ"]);
+  // No junk cash-ins: ART (+3) or a 3-letter word is never played for coins mid-game.
+  assert.deepEqual(plan("ARTE", { needCoins: true }).words, []);
+  assert.deepEqual(plan("ZITE", { balance: 2 }).words, []);
 });
 
 test("words: endgame and panic play everything, biggest first", () => {

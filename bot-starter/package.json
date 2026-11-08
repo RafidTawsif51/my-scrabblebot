@@ -9,6 +9,7 @@
     "test": "node --import tsx --test src/strategy.test.ts",
     "sim": "tsx src/sim.ts",
     "bench": "tsx src/bench.ts",
+    "compare": "tsx tools/compare.ts",
     "build": "tsc"
   },
   "dependencies": {

@@ -29,7 +29,7 @@ import * as path from "node:path";
 import { countsKey, Dictionary, emptyCounts, letterIndex, totalOf, wordReward, type Counts } from "./dictionary.js";
 import { MatchLogger } from "./logger.js";
 import { Player, type PlayerView } from "./player.js";
-import type { AuctionKind } from "./strategy.js";
+import { paramsForMode, type AuctionKind, type JaegerMode } from "./strategy.js";
 
 const HOST = process.env.STDB_HOST ?? "https://maincloud.spacetimedb.com";
 const DB_NAME = process.env.STDB_DB ?? "scrabblebot";
@@ -39,8 +39,6 @@ const BOT_NONCE = process.env.BOT_NONCE; // from the CLI, first run only
 const TOURNAMENT_ID = process.env.TOURNAMENT_ID;
 const SHADOW = process.env.SHADOW === "1";
 const TOKEN_PATH = path.join(process.cwd(), `.token-${BOT_NAME}`);
-/** A reducer slower than this switches the match to "play everything now". */
-const PANIC_LATENCY_MS = 1500;
 
 function loadToken(): string | undefined {
   try {
@@ -68,7 +66,15 @@ if (DICT.size < 100_000) {
 }
 log(`dictionary: ${DICT.size} words`);
 
-const player = new Player(DICT);
+// Live A/B: $env:JAEGER_MODE = "v3" (default, current behaviour) or "lucent".
+const MODE_RAW = (process.env.JAEGER_MODE ?? "v3").trim().toLowerCase();
+if (MODE_RAW !== "v3" && MODE_RAW !== "lucent" && MODE_RAW !== "lucent2" && MODE_RAW !== "fuel") {
+  console.error(`[${tag}] unknown JAEGER_MODE "${MODE_RAW}" (use v3, lucent, lucent2 or fuel)`);
+  process.exit(1);
+}
+const MODE: JaegerMode = MODE_RAW;
+const player = new Player(DICT, { params: paramsForMode(MODE) });
+log(`mode: ${MODE}`);
 
 // ---------- Per-connection state ----------
 
@@ -169,10 +175,13 @@ function timed(what: string, call: () => Promise<void>): Promise<boolean> {
 
 function noteLatency(what: string, ms: number) {
   logger?.latency(ms);
-  if (ms > PANIC_LATENCY_MS && player.tracker && !player.panic) {
-    player.panic = true;
-    warn(`${what} took ${Math.round(ms)} ms: panic mode, playing all words now`);
-    logger?.note(`panic: ${what} took ${Math.round(ms)} ms`);
+  const before = player.endgameBag();
+  player.recordCallLatency(ms);
+  const after = player.endgameBag();
+  // A spike is never a global panic: it only moves the endgame dump earlier.
+  if (after > before) {
+    warn(`${what} took ${Math.round(ms)} ms: endgame dump threshold now bag <= ${after}`);
+    logger?.note(`latency spike: ${what} ${Math.round(ms)} ms -> endgame threshold ${after}`);
     queueThink();
   }
 }
@@ -220,6 +229,7 @@ function startMatch(conn: DbConnection, matchId: bigint) {
     (x) => x.status.tag === "Swiss" || x.status.tag === "Bracket" || x.status.tag === "Final",
   );
   logger = new MatchLogger(BOT_NAME, matchId, {
+    mode: MODE,
     auctionType: m.auctionType.tag,
     players: parts.length,
     startingRack: rack,
@@ -229,7 +239,7 @@ function startMatch(conn: DbConnection, matchId: bigint) {
   });
   const p95 = player.wordLatencyP95();
   log(
-    `match ${matchId} started: ${parts.length} players, ${m.auctionType.tag}, rack ${rack}, bag ${m.bagTotal}, ` +
+    `match ${matchId} started (mode ${MODE}): ${parts.length} players, ${m.auctionType.tag}, rack ${rack}, bag ${m.bagTotal}, ` +
       `endgame at bag <= ${player.endgameBag()} (word p95 ${p95 === undefined ? "n/a" : Math.round(p95) + " ms"})`,
   );
   for (const a of auctions) if (a.status.tag === "Open") scheduleBid(conn, a.id);

@@ -8,6 +8,7 @@ import { marketPrice as liveMarketPrice } from "./market.js";
 import {
   decideBid,
   dynamicEndgameBag,
+  EXACT_BEAM,
   PARAMS,
   planWords,
   type AuctionKind,
@@ -43,7 +44,10 @@ export interface BidOutcome extends BidDecision {
 export class Player {
   tracker: MatchTracker | null = null;
   numPlayers = 6;
-  /** Set when a reducer took too long: stop hoarding for the rest of the match. */
+  /**
+   * Legacy "dump everything now" switch. Never set any more: a latency
+   * spike raises the endgame threshold instead (see endgameBag).
+   */
   panic = false;
   needCoins = false;
   private cache = new Map<string, ValuationJob>();
@@ -108,13 +112,20 @@ export class Player {
   /** Decide the bid for the open auction, then queue precompute for the next one. */
   private bingo: BingoIndex | null = null;
 
+  /** Lucent2 endgame: how much `letter` raises the exact best partition of my rack. */
+  endgameGain(rack: Counts, letter: number): number {
+    const withL = Uint8Array.from(rack);
+    withL[letter]!++;
+    return this.dict.bestPlays(withL, EXACT_BEAM).total - this.dict.bestPlays(rack, EXACT_BEAM).total;
+  }
+
   bid(letter: string, view: PlayerView): BidOutcome {
     const t = this.tracker!;
     const li = letterIndex(letter);
     const { value, source, k } = this.valueOf(letter, view);
     const market = t.marketPrice(letter);
     let fit: number | undefined;
-    if (this.P.lucentMode > 0) {
+    if (this.P.lucentMode > 0 || this.P.fuelMode > 0) {
       this.bingo ??= new BingoIndex(this.dict);
       const face = LETTER_VALUES[li]!;
       fit = relativeGain(this.bingo.leave(view.rack), li) * (1 + (this.P.hvBoost * (face - 1)) / 9);
@@ -134,6 +145,9 @@ export class Player {
       round: t.closedCount + 1,
       maxOppBalance: t.maxOppBalance(),
       oppTotalBalance: t.oppTotalBalance(),
+      matchPrice: this.P.fuelMode > 0 ? t.classPrice(letter, liveMarketPrice) : undefined,
+      endgameGain: this.P.lucent2 > 0 && view.bagTotal <= this.P.l2EndBag && li >= 0 ? this.endgameGain(view.rack, li) : undefined,
+      recentSpend: this.P.fuelMode > 0 ? t.recentMySpend(this.P.fuelCtrlWindow) : undefined,
       params: this.opts.params,
     });
     this.needCoins = dec.desired > view.balance && dec.desired > 0;
@@ -223,9 +237,30 @@ export class Player {
     return s[Math.min(s.length - 1, Math.floor(0.95 * s.length))];
   }
 
-  /** max(3, ceil(p95 word latency / auction length) + 2), see strategy.ts. */
+  // Latency of the last ~10 reducer calls of any kind (bids, words, ...).
+  private callLatencies: number[] = [];
+
+  recordCallLatency(ms: number) {
+    this.callLatencies.push(ms);
+    if (this.callLatencies.length > 10) this.callLatencies.shift();
+  }
+
+  /** Slowest of the last ~10 calls, if it was a spike (slower than one auction). */
+  latencySpike(): number | undefined {
+    const max = Math.max(0, ...this.callLatencies);
+    return max > this.auctionMs ? max : undefined;
+  }
+
+  /**
+   * Bag size at which to dump all words:
+   * max(3, ceil(p95 word latency / auction) + 2), raised by a recent spike
+   * to ceil(spike / auction) + 3. A spike never dumps words mid-game; it
+   * only starts the endgame dump earlier.
+   */
   endgameBag(): number {
-    return dynamicEndgameBag(this.P.endgameBag, this.wordLatencyP95(), this.auctionMs);
+    const base = dynamicEndgameBag(this.P.endgameBag, this.wordLatencyP95(), this.auctionMs);
+    const spike = this.latencySpike();
+    return spike === undefined ? base : Math.max(base, Math.ceil(spike / Math.max(1, this.auctionMs)) + 3);
   }
 
   /** Words to play now, given the rack actually available. */
@@ -238,6 +273,11 @@ export class Player {
       panic: this.panic,
       needCoins: this.needCoins,
       endgameBag: this.endgameBag(),
+      leave:
+        this.P.fuelMode > 0 || this.P.lucent2 > 0
+          ? (r) => Math.log1p((this.bingo ??= new BingoIndex(this.dict)).leave(r).score)
+          : undefined,
+      pool: this.P.lucent2 > 0 && this.tracker ? this.tracker.pool(view.rack) : undefined,
       params: this.opts.params,
     });
     if (plan.words.length > 0 && plan.reason.startsWith("need coins")) this.needCoins = false;
